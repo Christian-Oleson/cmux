@@ -6,32 +6,61 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex};
 use tracing::{debug, error, info};
 
+struct ManagedPane {
+    pty: Arc<ConPty>,
+}
+
 struct ManagedSession {
     id: u32,
     name: String,
-    pty: Arc<ConPty>,
+    panes: HashMap<u32, ManagedPane>,
+    next_pane_id: u32,
     created_at: u64,
 }
 
 pub struct SessionManager {
     sessions: Arc<Mutex<HashMap<String, ManagedSession>>>,
-    next_id: Arc<Mutex<u32>>,
-    /// Broadcast channel for pane output — multiple clients can subscribe.
+    next_session_id: Arc<Mutex<u32>>,
     output_tx: broadcast::Sender<ServerMessage>,
 }
 
 impl SessionManager {
     pub fn new() -> Self {
-        let (output_tx, _) = broadcast::channel(1024);
+        let (output_tx, _) = broadcast::channel(4096);
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
-            next_id: Arc::new(Mutex::new(0)),
+            next_session_id: Arc::new(Mutex::new(0)),
             output_tx,
         }
     }
 
     pub fn subscribe_output(&self) -> broadcast::Receiver<ServerMessage> {
         self.output_tx.subscribe()
+    }
+
+    fn spawn_pane_reader(pty: Arc<ConPty>, pane_id: u32, tx: broadcast::Sender<ServerMessage>) {
+        tokio::spawn(async move {
+            let mut buf = [0u8; 8192];
+            loop {
+                match pty.read(&mut buf).await {
+                    Ok(0) => {
+                        debug!(pane_id, "PTY output EOF");
+                        break;
+                    }
+                    Ok(n) => {
+                        let msg = ServerMessage::PaneOutput {
+                            pane_id,
+                            data: buf[..n].to_vec(),
+                        };
+                        let _ = tx.send(msg);
+                    }
+                    Err(e) => {
+                        error!(pane_id, error = %e, "PTY read error");
+                        break;
+                    }
+                }
+            }
+        });
     }
 
     pub async fn create_session(
@@ -45,7 +74,7 @@ impl SessionManager {
             return Err(CmuxError::Ipc(format!("Session '{}' already exists", name)));
         }
 
-        let mut id = self.next_id.lock().await;
+        let mut id = self.next_session_id.lock().await;
         let session_id = *id;
         *id += 1;
 
@@ -57,33 +86,12 @@ impl SessionManager {
         let pty =
             Arc::new(ConPty::spawn(&config).map_err(|e| CmuxError::Pty(format!("spawn: {e}")))?);
 
-        // Start output reader task
-        let pty_reader = Arc::clone(&pty);
-        let tx = self.output_tx.clone();
-        let pane_id = session_id;
-        tokio::spawn(async move {
-            let mut buf = [0u8; 8192];
-            loop {
-                match pty_reader.read(&mut buf).await {
-                    Ok(0) => {
-                        debug!(pane_id, "PTY output EOF");
-                        break;
-                    }
-                    Ok(n) => {
-                        let msg = ServerMessage::PaneOutput {
-                            pane_id,
-                            data: buf[..n].to_vec(),
-                        };
-                        // Ignore send errors (no subscribers)
-                        let _ = tx.send(msg);
-                    }
-                    Err(e) => {
-                        error!(pane_id, error = %e, "PTY read error");
-                        break;
-                    }
-                }
-            }
-        });
+        // Pane 0 is the initial pane
+        let pane_id = 0u32;
+        Self::spawn_pane_reader(Arc::clone(&pty), pane_id, self.output_tx.clone());
+
+        let mut panes = HashMap::new();
+        panes.insert(pane_id, ManagedPane { pty });
 
         let created_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -95,13 +103,61 @@ impl SessionManager {
             ManagedSession {
                 id: session_id,
                 name: name.clone(),
-                pty,
+                panes,
+                next_pane_id: 1,
                 created_at,
             },
         );
 
         info!(session_id, name = %name, "Session created");
         Ok((session_id, name))
+    }
+
+    pub async fn split_pane(
+        &self,
+        session_name: &str,
+        cols: u16,
+        rows: u16,
+    ) -> Result<(u32, u16, u16), CmuxError> {
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions
+            .get_mut(session_name)
+            .ok_or_else(|| CmuxError::SessionNotFound(session_name.into()))?;
+
+        let pane_id = session.next_pane_id;
+        session.next_pane_id += 1;
+
+        let config = ConPtyConfig {
+            cols,
+            rows,
+            ..ConPtyConfig::default()
+        };
+
+        let pty =
+            Arc::new(ConPty::spawn(&config).map_err(|e| CmuxError::Pty(format!("spawn: {e}")))?);
+
+        Self::spawn_pane_reader(Arc::clone(&pty), pane_id, self.output_tx.clone());
+
+        session.panes.insert(pane_id, ManagedPane { pty });
+
+        info!(pane_id, session = %session_name, "Pane created");
+        Ok((pane_id, cols, rows))
+    }
+
+    pub async fn close_pane(&self, session_name: &str, pane_id: u32) -> Result<(), CmuxError> {
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions
+            .get_mut(session_name)
+            .ok_or_else(|| CmuxError::SessionNotFound(session_name.into()))?;
+
+        match session.panes.remove(&pane_id) {
+            Some(pane) => {
+                let _ = pane.pty.kill();
+                info!(pane_id, session = %session_name, "Pane closed");
+                Ok(())
+            }
+            None => Err(CmuxError::PaneNotFound(cmux_core::types::PaneId(pane_id))),
+        }
     }
 
     pub async fn list_sessions(&self) -> Vec<SessionInfo> {
@@ -111,7 +167,7 @@ impl SessionManager {
             .map(|s| SessionInfo {
                 id: s.id,
                 name: s.name.clone(),
-                pane_count: 1,
+                pane_count: s.panes.len(),
                 created_at: s.created_at,
             })
             .collect()
@@ -121,7 +177,9 @@ impl SessionManager {
         let mut sessions = self.sessions.lock().await;
         match sessions.remove(name) {
             Some(session) => {
-                let _ = session.pty.kill();
+                for pane in session.panes.values() {
+                    let _ = pane.pty.kill();
+                }
                 info!(name = %name, "Session killed");
                 Ok(())
             }
@@ -129,31 +187,22 @@ impl SessionManager {
         }
     }
 
-    pub async fn send_input(&self, session_name: &str, data: &[u8]) -> Result<(), CmuxError> {
-        let sessions = self.sessions.lock().await;
-        match sessions.get(session_name) {
-            Some(session) => {
-                session.pty.write(data).await?;
-                Ok(())
-            }
-            None => Err(CmuxError::SessionNotFound(session_name.into())),
-        }
-    }
-
-    #[allow(dead_code)]
-    pub async fn resize_session(
+    pub async fn send_input(
         &self,
         session_name: &str,
-        cols: u16,
-        rows: u16,
+        pane_id: u32,
+        data: &[u8],
     ) -> Result<(), CmuxError> {
         let sessions = self.sessions.lock().await;
-        match sessions.get(session_name) {
-            Some(session) => {
-                session.pty.resize(cols, rows)?;
+        let session = sessions
+            .get(session_name)
+            .ok_or_else(|| CmuxError::SessionNotFound(session_name.into()))?;
+        match session.panes.get(&pane_id) {
+            Some(pane) => {
+                pane.pty.write(data).await?;
                 Ok(())
             }
-            None => Err(CmuxError::SessionNotFound(session_name.into())),
+            None => Err(CmuxError::PaneNotFound(cmux_core::types::PaneId(pane_id))),
         }
     }
 }

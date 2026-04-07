@@ -1,5 +1,6 @@
+use crate::pane_manager::PaneManager;
 use crate::renderer::Renderer;
-use cmux_core::screen::ScreenBuffer;
+use cmux_core::layout::SplitDirection;
 use cmux_ipc::messages::{ClientMessage, ServerMessage};
 use cmux_ipc::transport;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers};
@@ -8,7 +9,12 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_stream::StreamExt;
 use tracing::debug;
 
-/// RAII guard that restores terminal state on drop.
+/// Prefix key input state.
+enum InputMode {
+    Normal,
+    WaitingForPrefixCommand,
+}
+
 struct RawModeGuard;
 
 impl RawModeGuard {
@@ -30,7 +36,6 @@ impl Drop for RawModeGuard {
     }
 }
 
-/// Run an interactive terminal session connected to the daemon.
 pub async fn run_terminal<R, W>(
     mut pipe_reader: R,
     mut pipe_writer: W,
@@ -45,9 +50,9 @@ where
     let (cols, rows) = crossterm::terminal::size()?;
     debug!(cols, rows, "Terminal size");
 
-    let mut screen = ScreenBuffer::new(rows, cols);
+    let mut panes = PaneManager::new(rows, cols);
     let mut renderer = Renderer::new();
-
+    let mut input_mode = InputMode::Normal;
     let mut event_stream = EventStream::new();
 
     loop {
@@ -55,31 +60,51 @@ where
             event = event_stream.next() => {
                 match event {
                     Some(Ok(Event::Key(key_event))) => {
-                        if key_event.modifiers.contains(KeyModifiers::CONTROL)
-                            && key_event.code == KeyCode::Char('c')
-                        {
-                            let msg = ClientMessage::PaneInput {
-                                pane_id: 0,
-                                data: vec![0x03],
-                            };
-                            transport::write_message(&mut pipe_writer, &msg).await?;
-                        } else if let Some(bytes) = key_event_to_bytes(&key_event) {
-                            let msg = ClientMessage::PaneInput {
-                                pane_id: 0,
-                                data: bytes,
-                            };
-                            transport::write_message(&mut pipe_writer, &msg).await?;
+                        match input_mode {
+                            InputMode::Normal => {
+                                // Check for prefix key: Ctrl+B
+                                if key_event.modifiers.contains(KeyModifiers::CONTROL)
+                                    && key_event.code == KeyCode::Char('b')
+                                {
+                                    input_mode = InputMode::WaitingForPrefixCommand;
+                                    continue;
+                                }
+
+                                // Forward input to active pane
+                                if let Some(bytes) = key_event_to_bytes(&key_event) {
+                                    let msg = ClientMessage::PaneInput {
+                                        pane_id: panes.active_pane().0,
+                                        data: bytes,
+                                    };
+                                    transport::write_message(&mut pipe_writer, &msg).await?;
+                                }
+                            }
+                            InputMode::WaitingForPrefixCommand => {
+                                input_mode = InputMode::Normal;
+                                handle_prefix_command(
+                                    &key_event,
+                                    &mut panes,
+                                    &mut renderer,
+                                    &mut pipe_writer,
+                                ).await?;
+                            }
                         }
                     }
                     Some(Ok(Event::Resize(new_cols, new_rows))) => {
                         debug!(cols = new_cols, rows = new_rows, "Terminal resized");
-                        screen.resize(new_rows, new_cols);
+                        panes.resize_terminal(new_rows, new_cols);
+                        let snaps = panes.snapshots();
                         let mut stdout = std::io::stdout().lock();
-                        renderer.render_full(&screen, &mut stdout)?;
+                        renderer.render_full(
+                            &snaps,
+                            panes.layout(),
+                            panes.active_pane(),
+                            &mut stdout,
+                        )?;
                     }
                     Some(Ok(Event::Paste(text))) => {
                         let msg = ClientMessage::PaneInput {
-                            pane_id: 0,
+                            pane_id: panes.active_pane().0,
                             data: text.into_bytes(),
                         };
                         transport::write_message(&mut pipe_writer, &msg).await?;
@@ -95,10 +120,24 @@ where
 
             msg = transport::read_message::<_, ServerMessage>(&mut pipe_reader) => {
                 match msg {
-                    Ok(Some(ServerMessage::PaneOutput { data, .. })) => {
-                        screen.process(&data);
+                    Ok(Some(ServerMessage::PaneOutput { pane_id, data })) => {
+                        panes.process_output(cmux_core::types::PaneId(pane_id), &data);
+                        let snaps = panes.snapshots();
                         let mut stdout = std::io::stdout().lock();
-                        renderer.render_diff(&screen, &mut stdout)?;
+                        renderer.render_diff(
+                            &snaps,
+                            panes.layout(),
+                            panes.active_pane(),
+                            &mut stdout,
+                        )?;
+                    }
+                    Ok(Some(ServerMessage::PaneCreated { pane_id: _, cols: _, rows: _ })) => {
+                        // Pane was created on daemon side — the client already
+                        // split the layout in handle_prefix_command, so nothing
+                        // additional needed here.
+                    }
+                    Ok(Some(ServerMessage::PaneClosed { pane_id: _ })) => {
+                        // Already handled client-side in handle_prefix_command
                     }
                     Ok(Some(ServerMessage::Error { message })) => {
                         eprintln!("\r\ncmux error: {message}\r");
@@ -121,7 +160,111 @@ where
     Ok(())
 }
 
-/// Convert a crossterm KeyEvent to bytes to send to the PTY.
+async fn handle_prefix_command<W: AsyncWrite + Unpin>(
+    key: &KeyEvent,
+    panes: &mut PaneManager,
+    renderer: &mut Renderer,
+    pipe_writer: &mut W,
+) -> anyhow::Result<()> {
+    match key.code {
+        // Split vertical: prefix + %
+        KeyCode::Char('%') => {
+            let direction = SplitDirection::Vertical;
+            // Request daemon to create new pane PTY
+            transport::write_message(
+                pipe_writer,
+                &ClientMessage::SplitPane {
+                    direction: "vertical".into(),
+                },
+            )
+            .await?;
+            // Update local layout
+            panes.split(direction);
+            let snaps = panes.snapshots();
+            let mut stdout = std::io::stdout().lock();
+            renderer.render_full(&snaps, panes.layout(), panes.active_pane(), &mut stdout)?;
+        }
+
+        // Split horizontal: prefix + "
+        KeyCode::Char('"') => {
+            let direction = SplitDirection::Horizontal;
+            transport::write_message(
+                pipe_writer,
+                &ClientMessage::SplitPane {
+                    direction: "horizontal".into(),
+                },
+            )
+            .await?;
+            panes.split(direction);
+            let snaps = panes.snapshots();
+            let mut stdout = std::io::stdout().lock();
+            renderer.render_full(&snaps, panes.layout(), panes.active_pane(), &mut stdout)?;
+        }
+
+        // Close pane: prefix + x
+        KeyCode::Char('x') => {
+            let active = panes.active_pane();
+            transport::write_message(pipe_writer, &ClientMessage::ClosePane { pane_id: active.0 })
+                .await?;
+            panes.close_pane(active);
+            let snaps = panes.snapshots();
+            let mut stdout = std::io::stdout().lock();
+            renderer.render_full(&snaps, panes.layout(), panes.active_pane(), &mut stdout)?;
+        }
+
+        // Zoom/unzoom: prefix + z
+        KeyCode::Char('z') => {
+            panes.layout_mut().toggle_zoom();
+            let snaps = panes.snapshots();
+            let mut stdout = std::io::stdout().lock();
+            renderer.render_full(&snaps, panes.layout(), panes.active_pane(), &mut stdout)?;
+        }
+
+        // Cycle pane forward: prefix + o
+        KeyCode::Char('o') => {
+            panes.layout_mut().cycle_pane(true);
+            let snaps = panes.snapshots();
+            let mut stdout = std::io::stdout().lock();
+            renderer.render_full(&snaps, panes.layout(), panes.active_pane(), &mut stdout)?;
+        }
+
+        // Navigate: prefix + arrow keys
+        KeyCode::Up => {
+            panes
+                .layout_mut()
+                .navigate(SplitDirection::Horizontal, false);
+            let snaps = panes.snapshots();
+            let mut stdout = std::io::stdout().lock();
+            renderer.render_diff(&snaps, panes.layout(), panes.active_pane(), &mut stdout)?;
+        }
+        KeyCode::Down => {
+            panes
+                .layout_mut()
+                .navigate(SplitDirection::Horizontal, true);
+            let snaps = panes.snapshots();
+            let mut stdout = std::io::stdout().lock();
+            renderer.render_diff(&snaps, panes.layout(), panes.active_pane(), &mut stdout)?;
+        }
+        KeyCode::Left => {
+            panes.layout_mut().navigate(SplitDirection::Vertical, false);
+            let snaps = panes.snapshots();
+            let mut stdout = std::io::stdout().lock();
+            renderer.render_diff(&snaps, panes.layout(), panes.active_pane(), &mut stdout)?;
+        }
+        KeyCode::Right => {
+            panes.layout_mut().navigate(SplitDirection::Vertical, true);
+            let snaps = panes.snapshots();
+            let mut stdout = std::io::stdout().lock();
+            renderer.render_diff(&snaps, panes.layout(), panes.active_pane(), &mut stdout)?;
+        }
+
+        // Unknown prefix command — ignore
+        _ => {}
+    }
+
+    Ok(())
+}
+
 fn key_event_to_bytes(event: &KeyEvent) -> Option<Vec<u8>> {
     let ctrl = event.modifiers.contains(KeyModifiers::CONTROL);
 

@@ -160,10 +160,54 @@ where
                 let _ = resp_tx.send(ServerMessage::Ok).await;
             }
 
-            ClientMessage::PaneInput { data, .. } => {
+            ClientMessage::PaneInput { pane_id, data } => {
                 if let Some(ref session_name) = attached_session {
-                    if let Err(e) = session_manager.send_input(session_name, &data).await {
+                    if let Err(e) = session_manager
+                        .send_input(session_name, pane_id, &data)
+                        .await
+                    {
                         warn!(error = %e, "Failed to send input to PTY");
+                    }
+                }
+            }
+
+            ClientMessage::SplitPane { direction: _ } => {
+                if let Some(ref session_name) = attached_session {
+                    // Use default terminal size for new pane — client will resize
+                    match session_manager.split_pane(session_name, 80, 24).await {
+                        Ok((pane_id, cols, rows)) => {
+                            let _ = resp_tx
+                                .send(ServerMessage::PaneCreated {
+                                    pane_id,
+                                    cols,
+                                    rows,
+                                })
+                                .await;
+                        }
+                        Err(e) => {
+                            let _ = resp_tx
+                                .send(ServerMessage::Error {
+                                    message: e.to_string(),
+                                })
+                                .await;
+                        }
+                    }
+                }
+            }
+
+            ClientMessage::ClosePane { pane_id } => {
+                if let Some(ref session_name) = attached_session {
+                    match session_manager.close_pane(session_name, pane_id).await {
+                        Ok(()) => {
+                            let _ = resp_tx.send(ServerMessage::PaneClosed { pane_id }).await;
+                        }
+                        Err(e) => {
+                            let _ = resp_tx
+                                .send(ServerMessage::Error {
+                                    message: e.to_string(),
+                                })
+                                .await;
+                        }
                     }
                 }
             }

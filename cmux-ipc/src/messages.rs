@@ -10,6 +10,8 @@ pub enum ClientMessage {
     Attach { session: String },
     Detach,
     PaneInput { pane_id: u32, data: Vec<u8> },
+    SplitPane { direction: String },
+    ClosePane { pane_id: u32 },
 }
 
 /// Session info returned in listings.
@@ -28,6 +30,8 @@ pub enum ServerMessage {
     SessionCreated { id: u32, name: String },
     SessionList { sessions: Vec<SessionInfo> },
     PaneOutput { pane_id: u32, data: Vec<u8> },
+    PaneCreated { pane_id: u32, cols: u16, rows: u16 },
+    PaneClosed { pane_id: u32 },
     Error { message: String },
     Ok,
 }

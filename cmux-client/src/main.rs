@@ -1,4 +1,5 @@
 mod connection;
+mod pane_manager;
 mod renderer;
 mod terminal;
 

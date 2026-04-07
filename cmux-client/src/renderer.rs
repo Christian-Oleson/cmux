@@ -1,11 +1,13 @@
+use cmux_core::layout::LayoutEngine;
 use cmux_core::screen::{CellInfo, Color, ScreenBuffer, ScreenSnapshot};
+use cmux_core::types::PaneId;
 use crossterm::cursor;
 use crossterm::style::{self, Attribute, Attributes, ContentStyle, StyledContent};
 use crossterm::terminal;
 use crossterm::QueueableCommand;
+use std::collections::HashMap;
 use std::io::Write;
 
-/// Converts our Color type to a crossterm Color.
 fn to_crossterm_color(color: Color) -> style::Color {
     match color {
         Color::Default => style::Color::Reset,
@@ -14,7 +16,6 @@ fn to_crossterm_color(color: Color) -> style::Color {
     }
 }
 
-/// Build a ContentStyle for a cell.
 fn cell_style(cell: &CellInfo) -> ContentStyle {
     let mut attrs = Attributes::default();
     if cell.bold {
@@ -38,122 +39,201 @@ fn cell_style(cell: &CellInfo) -> ContentStyle {
     }
 }
 
-/// Emit a single cell at (row, col) using crossterm queue commands.
 fn emit_cell<W: Write>(out: &mut W, row: u16, col: u16, cell: &CellInfo) -> std::io::Result<()> {
     out.queue(cursor::MoveTo(col, row))?;
-
     let display_char = if cell.contents.is_empty() {
         " "
     } else {
         &cell.contents
     };
-
     let styled = StyledContent::new(cell_style(cell), display_char);
     out.queue(style::PrintStyledContent(styled))?;
     Ok(())
 }
 
-/// Crossterm-based differential renderer for a ScreenBuffer.
 pub struct Renderer {
-    prev_snapshot: Option<ScreenSnapshot>,
+    prev_snapshots: HashMap<PaneId, ScreenSnapshot>,
 }
 
 impl Renderer {
     pub fn new() -> Self {
         Self {
-            prev_snapshot: None,
+            prev_snapshots: HashMap::new(),
         }
     }
 
-    /// Full redraw of the entire screen.
+    /// Full redraw of all panes at their layout positions with borders.
     pub fn render_full<W: Write>(
         &mut self,
-        screen: &ScreenBuffer,
+        snapshots: &HashMap<PaneId, ScreenSnapshot>,
+        layout: &LayoutEngine,
+        active_pane: PaneId,
         out: &mut W,
     ) -> std::io::Result<()> {
-        let snapshot = screen.snapshot();
-
         out.queue(cursor::Hide)?;
         out.queue(style::ResetColor)?;
+        out.queue(terminal::Clear(terminal::ClearType::All))?;
 
-        for (r, row) in snapshot.cells.iter().enumerate() {
-            // Move to start of row and clear it
-            out.queue(cursor::MoveTo(0, r as u16))?;
-            out.queue(terminal::Clear(terminal::ClearType::CurrentLine))?;
+        let rects = layout.pane_rects();
 
-            for (c, cell) in row.iter().enumerate() {
-                // Skip continuation cells of wide characters
-                if cell.contents.is_empty() && c > 0 {
-                    // Check if previous cell was wide — if so this is a continuation, skip
-                    let prev = &row[c - 1];
-                    if !prev.contents.is_empty() && prev.contents.chars().count() == 1 {
-                        // Might be a wide char continuation — skip
-                        continue;
+        // Draw each pane's contents
+        for rect in &rects {
+            if let Some(snapshot) = snapshots.get(&rect.pane_id) {
+                for (r, row) in snapshot.cells.iter().enumerate() {
+                    let term_row = rect.row + r as u16;
+                    for (c, cell) in row.iter().enumerate() {
+                        let term_col = rect.col + c as u16;
+                        if r < rect.height as usize && c < rect.width as usize {
+                            emit_cell(out, term_row, term_col, cell)?;
+                        }
                     }
                 }
-                emit_cell(out, r as u16, c as u16, cell)?;
             }
         }
 
-        // Restore cursor
-        out.queue(style::ResetColor)?;
-        if snapshot.cursor_visible {
-            out.queue(cursor::MoveTo(snapshot.cursor_col, snapshot.cursor_row))?;
-            out.queue(cursor::Show)?;
-        }
+        // Draw borders
+        self.draw_borders(out, layout, active_pane)?;
+
+        // Position cursor at active pane's cursor
+        self.restore_cursor(out, snapshots, &rects, active_pane)?;
 
         out.flush()?;
-        self.prev_snapshot = Some(snapshot);
+        self.prev_snapshots = snapshots.clone();
         Ok(())
     }
 
-    /// Differential render — only redraw cells that changed since last render.
+    /// Differential render — only redraw cells that changed.
     pub fn render_diff<W: Write>(
         &mut self,
-        screen: &ScreenBuffer,
+        snapshots: &HashMap<PaneId, ScreenSnapshot>,
+        layout: &LayoutEngine,
+        active_pane: PaneId,
         out: &mut W,
     ) -> std::io::Result<()> {
-        let new_snapshot = screen.snapshot();
-
-        let prev = match &self.prev_snapshot {
-            Some(prev) => prev,
-            None => {
-                // No previous frame — do full render
-                self.prev_snapshot = Some(new_snapshot);
-                return self.render_full(screen, out);
-            }
-        };
-
-        let changes = ScreenBuffer::diff(prev, &new_snapshot);
-
-        if changes.is_empty()
-            && prev.cursor_row == new_snapshot.cursor_row
-            && prev.cursor_col == new_snapshot.cursor_col
-            && prev.cursor_visible == new_snapshot.cursor_visible
-        {
-            // Nothing changed
-            self.prev_snapshot = Some(new_snapshot);
-            return Ok(());
+        if self.prev_snapshots.is_empty() {
+            return self.render_full(snapshots, layout, active_pane, out);
         }
+
+        let rects = layout.pane_rects();
+        let mut has_changes = false;
 
         out.queue(cursor::Hide)?;
 
-        for change in &changes {
-            emit_cell(out, change.row, change.col, &change.cell)?;
+        for rect in &rects {
+            if let Some(new_snap) = snapshots.get(&rect.pane_id) {
+                if let Some(old_snap) = self.prev_snapshots.get(&rect.pane_id) {
+                    let changes = ScreenBuffer::diff(old_snap, new_snap);
+                    if !changes.is_empty() {
+                        has_changes = true;
+                        for change in &changes {
+                            let term_row = rect.row + change.row;
+                            let term_col = rect.col + change.col;
+                            if change.row < rect.height && change.col < rect.width {
+                                emit_cell(out, term_row, term_col, &change.cell)?;
+                            }
+                        }
+                    }
+                } else {
+                    // New pane — full render for this pane
+                    has_changes = true;
+                    for (r, row) in new_snap.cells.iter().enumerate() {
+                        for (c, cell) in row.iter().enumerate() {
+                            if r < rect.height as usize && c < rect.width as usize {
+                                emit_cell(out, rect.row + r as u16, rect.col + c as u16, cell)?;
+                            }
+                        }
+                    }
+                }
+            }
         }
 
-        // Reset and restore cursor
+        // Always update cursor position
+        self.restore_cursor(out, snapshots, &rects, active_pane)?;
+
+        if has_changes {
+            out.flush()?;
+        }
+        self.prev_snapshots = snapshots.clone();
+        Ok(())
+    }
+
+    fn draw_borders<W: Write>(
+        &self,
+        out: &mut W,
+        layout: &LayoutEngine,
+        active_pane: PaneId,
+    ) -> std::io::Result<()> {
+        let border_cells = layout.border_cells();
+        let rects = layout.pane_rects();
+
+        // Determine which border cells are adjacent to the active pane
+        let active_rect = rects.iter().find(|r| r.pane_id == active_pane);
+
+        let border_style = ContentStyle {
+            foreground_color: Some(style::Color::DarkGrey),
+            ..ContentStyle::default()
+        };
+        let active_border_style = ContentStyle {
+            foreground_color: Some(style::Color::Green),
+            attributes: {
+                let mut a = Attributes::default();
+                a.set(Attribute::Bold);
+                a
+            },
+            ..ContentStyle::default()
+        };
+
+        for &(row, col, ch) in &border_cells {
+            out.queue(cursor::MoveTo(col, row))?;
+
+            // Check if this border cell is adjacent to the active pane
+            let is_active_border = active_rect
+                .map(|r| {
+                    // Adjacent means the border is right next to the active pane
+                    let adj_right =
+                        col == r.col + r.width && row >= r.row && row < r.row + r.height;
+                    let adj_left =
+                        r.col > 0 && col == r.col - 1 && row >= r.row && row < r.row + r.height;
+                    let adj_bottom =
+                        row == r.row + r.height && col >= r.col && col < r.col + r.width;
+                    let adj_top =
+                        r.row > 0 && row == r.row - 1 && col >= r.col && col < r.col + r.width;
+                    adj_right || adj_left || adj_bottom || adj_top
+                })
+                .unwrap_or(false);
+
+            let s = if is_active_border {
+                &active_border_style
+            } else {
+                &border_style
+            };
+            let ch_str = ch.to_string();
+            out.queue(style::PrintStyledContent(StyledContent::new(*s, &ch_str)))?;
+        }
+
+        Ok(())
+    }
+
+    fn restore_cursor<W: Write>(
+        &self,
+        out: &mut W,
+        snapshots: &HashMap<PaneId, ScreenSnapshot>,
+        rects: &[cmux_core::layout::PaneRect],
+        active_pane: PaneId,
+    ) -> std::io::Result<()> {
         out.queue(style::ResetColor)?;
-        if new_snapshot.cursor_visible {
-            out.queue(cursor::MoveTo(
-                new_snapshot.cursor_col,
-                new_snapshot.cursor_row,
-            ))?;
-            out.queue(cursor::Show)?;
+
+        if let Some(rect) = rects.iter().find(|r| r.pane_id == active_pane) {
+            if let Some(snap) = snapshots.get(&active_pane) {
+                let cursor_row = rect.row + snap.cursor_row;
+                let cursor_col = rect.col + snap.cursor_col;
+                out.queue(cursor::MoveTo(cursor_col, cursor_row))?;
+                if snap.cursor_visible {
+                    out.queue(cursor::Show)?;
+                }
+            }
         }
 
-        out.flush()?;
-        self.prev_snapshot = Some(new_snapshot);
         Ok(())
     }
 }

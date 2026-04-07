@@ -1,111 +1,154 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- Dos Apes Super Agent Framework - Phase Plan -->
 <!-- Generated: 2026-04-07 -->
-<!-- Phase: 2 -->
+<!-- Phase: 3 -->
 
 <plan>
   <metadata>
-    <phase>2</phase>
-    <name>Terminal Emulation &amp; Screen Buffer</name>
-    <goal>Parse VT escape sequences and maintain in-memory screen state per pane, then render via crossterm with differential updates</goal>
-    <deliverable>A single-pane terminal with correct crossterm-based rendering of colors, cursor, Unicode, and alternate screen — replaces raw byte passthrough</deliverable>
+    <phase>3</phase>
+    <name>Layout Engine &amp; Pane Management</name>
+    <goal>Split, resize, navigate, and zoom panes using a tree-based layout engine with Unicode borders</goal>
+    <deliverable>Multi-pane terminal with horizontal/vertical splits, directional navigation, resize, zoom, close, and pane borders</deliverable>
     <created>2026-04-07</created>
   </metadata>
 
   <context>
-    <dependencies>Phase 1 complete — ConPTY I/O, Named Pipe IPC, daemon/client working</dependencies>
+    <dependencies>Phase 2 complete — ScreenBuffer (vt100), Renderer (crossterm differential), daemon/client IPC</dependencies>
     <affected_areas>
-      - cmux-core: new screen buffer module
-      - cmux-client: new renderer, modified terminal loop
-      - cmux-daemon: daemon-side screen buffer per pane (for future reattach)
+      - cmux-core: new layout module (tree engine), IPC message additions
+      - cmux-client: multi-pane renderer, prefix key input handler, pane management
+      - cmux-daemon: multi-pane session manager, split/close/navigate commands
+      - cmux-ipc: new message variants for pane operations
     </affected_areas>
     <patterns_to_follow>
-      - vt100 crate handles VT parsing, screen state, colors, attributes, Unicode, alternate screen
-      - crossterm for cursor positioning, color output, attribute rendering
-      - Differential rendering: compare current frame vs previous, only emit crossterm commands for changed cells
-      - Current data flow: daemon sends ServerMessage::PaneOutput { data: Vec&lt;u8&gt; } with raw PTY bytes
-      - Client currently does: stdout.write_all(&amp;data) — this gets replaced with screen.process(&amp;data) + renderer.draw()
+      - Binary split tree: each internal node is a Split(Horizontal|Vertical), each leaf is a Pane
+      - Layout allocation: parent gives each child a proportional share of its area, accounting for 1-char border
+      - Renderer offset: emit_cell(layout.start_row + pane_row, layout.start_col + pane_col, cell)
+      - IPC already has pane_id on PaneOutput/PaneInput — extend with SplitPane, ClosePane, etc.
+      - Prefix key (Ctrl+B) triggers multiplexer commands — basic implementation here, full keybinding system in Phase 5
     </patterns_to_follow>
   </context>
 
   <tasks>
     <task id="1" type="backend" complete="false">
-      <name>Screen buffer module in cmux-core using vt100 crate</name>
+      <name>Tree-based layout engine with unit tests</name>
       <description>
-        Create a ScreenBuffer wrapper around the vt100 crate that provides a clean API
-        for processing PTY output, querying cell state, and computing diffs between frames.
-        This module will be used by both the daemon (to maintain pane state) and the client
-        (to parse incoming bytes for rendering).
+        Implement a binary split tree layout engine in cmux-core that manages pane
+        positions and dimensions. Supports horizontal/vertical splits, pane removal,
+        terminal resize, directional navigation, zoom, and predefined layouts.
+        Includes comprehensive unit tests.
       </description>
 
       <files>
         <create>
-          cmux-core/src/screen.rs              (ScreenBuffer wrapper, cell/color/attribute types)
+          cmux-core/src/layout.rs              (layout tree engine)
         </create>
         <modify>
-          cmux-core/Cargo.toml                 (add vt100 dependency)
-          cmux-core/src/lib.rs                 (add pub mod screen)
+          cmux-core/src/lib.rs                 (add pub mod layout)
         </modify>
       </files>
 
       <action>
-        1. Add `vt100 = "0.15"` to cmux-core/Cargo.toml dependencies.
+        1. Create cmux-core/src/layout.rs with the following types:
 
-        2. Create cmux-core/src/screen.rs with:
+           a) SplitDirection enum: Horizontal, Vertical
 
-           a) ScreenBuffer struct wrapping vt100::Parser:
-              - pub fn new(rows: u16, cols: u16) -> Self
-              - pub fn process(&amp;mut self, bytes: &amp;[u8])
-                * Feeds bytes into vt100::Parser
-              - pub fn screen(&amp;self) -> &amp;vt100::Screen
-                * Returns reference to the parsed screen state
-              - pub fn resize(&amp;mut self, rows: u16, cols: u16)
-                * Resizes the internal parser/screen
-              - pub fn cursor_position(&amp;self) -> (u16, u16)
-                * Returns (row, col) of cursor
-              - pub fn cursor_visible(&amp;self) -> bool
-              - pub fn title(&amp;self) -> &amp;str
-              - pub fn alternate_screen_active(&amp;self) -> bool
-
-           b) Helper functions for cell inspection:
-              - pub fn cell_at(&amp;self, row: u16, col: u16) -> Option&lt;CellInfo&gt;
-                * Returns cell character, fg color, bg color, attributes
-              - pub fn rows(&amp;self) -> u16
-              - pub fn cols(&amp;self) -> u16
-
-           c) CellInfo struct (derived from vt100::Cell):
-              - contents: String (the character(s) in this cell)
-              - fg: Color
-              - bg: Color
-              - bold: bool
-              - italic: bool
-              - underline: bool
-              - inverse: bool
-
-           d) Color enum:
-              - Default
-              - Idx(u8) — 0-255 palette
-              - Rgb(u8, u8, u8) — true color
+           b) LayoutNode enum (the tree):
+              - Leaf { pane_id: PaneId }
+              - Split { direction: SplitDirection, ratio: f32, first: Box&lt;LayoutNode&gt;, second: Box&lt;LayoutNode&gt; }
               
-              * Implement From&lt;vt100::Color&gt; for Color conversion
+              ratio is 0.0-1.0 representing how much space the first child gets.
+              Default 0.5 for even splits.
 
-           e) Snapshot for diffing:
-              - pub fn snapshot(&amp;self) -> ScreenSnapshot
-                * Captures current state (all cells, cursor, title) for later comparison
-              - ScreenSnapshot struct with cells grid, cursor pos, cursor visible, title
-              - pub fn diff(old: &amp;ScreenSnapshot, new: &amp;ScreenSnapshot) -> Vec&lt;CellChange&gt;
-                * Returns list of (row, col, CellInfo) that changed
+           c) PaneRect struct:
+              - pane_id: PaneId
+              - row: u16, col: u16 (top-left corner in terminal coords)
+              - height: u16, width: u16
 
-        3. The vt100 crate handles ALL of the following for us (no manual implementation needed):
-           - VT100/VT220/xterm escape sequence parsing
-           - True color (24-bit), 256-color, 16-color
-           - Unicode/UTF-8, wide characters, combining chars
-           - Alternate screen buffer
-           - SGR attributes (bold, italic, underline, strikethrough, inverse, dim)
-           - Cursor positioning, scrolling, line wrapping
-           - We just need to wrap it with a clean API
+           d) LayoutEngine struct:
+              - root: LayoutNode
+              - terminal_rows: u16, terminal_cols: u16
+              - next_pane_id: u32
+              - active_pane: PaneId
+              - zoomed_pane: Option&lt;PaneId&gt;
 
-        4. Add pub mod screen to cmux-core/src/lib.rs.
+        2. LayoutEngine methods:
+
+           - pub fn new(rows: u16, cols: u16) -> Self
+             * Creates root as Leaf with PaneId(0), active_pane = PaneId(0)
+
+           - pub fn pane_rects(&amp;self) -> Vec&lt;PaneRect&gt;
+             * Recursively traverse the tree starting with the full terminal area
+             * If zoomed_pane is Some, return only that pane at full terminal size
+             * For Split nodes: divide area (minus 1 for border) by ratio, recurse
+             * Horizontal split: top/bottom (border is a horizontal line between them)
+             * Vertical split: left/right (border is a vertical line between them)
+
+           - pub fn split(&amp;mut self, direction: SplitDirection) -> PaneId
+             * Find the leaf matching active_pane in the tree
+             * Replace it with Split { direction, ratio: 0.5, first: old_leaf, second: new_leaf }
+             * Assign new PaneId to the new leaf
+             * Set active_pane to the new pane
+             * Return the new PaneId
+
+           - pub fn close_pane(&amp;mut self, pane_id: PaneId) -> bool
+             * Find the Split node that contains the pane_id as a child
+             * Replace the Split with the OTHER child (the sibling)
+             * If active_pane was the closed pane, set it to remaining sibling's first leaf
+             * Return false if pane_id is the last pane (can't close)
+
+           - pub fn navigate(&amp;mut self, direction: SplitDirection, forward: bool)
+             * Find the active pane in the tree
+             * Navigate to the adjacent pane in the given direction
+             * For Vertical + forward: go right. For Vertical + !forward: go left.
+             * For Horizontal + forward: go down. For Horizontal + !forward: go up.
+             * Set active_pane to the target pane
+
+           - pub fn cycle_pane(&amp;mut self, forward: bool)
+             * Get all pane_ids in tree order (left-to-right DFS)
+             * Find active_pane index, move to next/prev (wrapping)
+
+           - pub fn resize_pane(&amp;mut self, direction: SplitDirection, amount: i16)
+             * Find the nearest Split ancestor of active_pane with matching direction
+             * Adjust its ratio by amount/terminal_dimension
+             * Clamp ratio to 0.1..0.9
+
+           - pub fn toggle_zoom(&amp;mut self)
+             * If zoomed_pane is None, set it to active_pane
+             * If zoomed_pane is Some, clear it
+
+           - pub fn resize_terminal(&amp;mut self, rows: u16, cols: u16)
+             * Update terminal_rows and terminal_cols
+             * pane_rects() will automatically recompute from new dimensions
+
+           - pub fn pane_ids(&amp;self) -> Vec&lt;PaneId&gt;
+             * Return all pane IDs in tree order
+
+           - pub fn active_pane(&amp;self) -> PaneId
+
+           - pub fn set_active_pane(&amp;mut self, pane_id: PaneId)
+
+           - pub fn border_cells(&amp;self) -> Vec&lt;(u16, u16, char)&gt;
+             * Compute all border character positions
+             * Use Unicode box-drawing: '│' (vertical), '─' (horizontal), '┼' (cross),
+               '┬' (top-T), '┴' (bottom-T), '├' (left-T), '┤' (right-T)
+             * Return Vec of (row, col, char) for the renderer to draw
+
+        3. Unit tests (inline #[cfg(test)] mod tests):
+           - new() creates single pane at (0, 0) filling terminal
+           - split vertical creates two panes side by side with border
+           - split horizontal creates two panes top/bottom with border
+           - nested splits (split, then split again) produce correct rects
+           - close_pane removes pane, sibling expands
+           - close last pane returns false
+           - cycle_pane wraps around
+           - resize_pane adjusts ratio
+           - toggle_zoom returns single full-screen pane
+           - resize_terminal updates all pane rects
+           - border_cells returns correct positions
+           - pane dimensions account for border (total - 1 for each split level)
+
+        4. Add pub mod layout to cmux-core/src/lib.rs
       </action>
 
       <verification>
@@ -115,230 +158,292 @@
       </verification>
 
       <done>
-        - ScreenBuffer wraps vt100::Parser with clean public API
-        - process() feeds bytes, screen state updates correctly
-        - cell_at() returns character, colors, attributes for any position
-        - snapshot() + diff() produce list of changed cells between frames
-        - resize() works without crashing
+        - LayoutEngine creates, splits, closes, navigates, resizes, zooms panes
+        - pane_rects() returns correct pixel-perfect positions for all panes
+        - border_cells() returns Unicode box-drawing characters at correct positions
         - All existing tests still pass
+        - 12+ new layout unit tests pass
       </done>
     </task>
 
     <task id="2" type="backend" complete="false">
-      <name>Crossterm differential renderer + client integration</name>
+      <name>Multi-pane renderer with borders and pane offset rendering</name>
       <description>
-        Build a renderer that takes a ScreenBuffer and draws it to the host terminal
-        using crossterm commands. Implements differential rendering by comparing the
-        current screen state against the previously rendered frame and only emitting
-        crossterm commands for cells that changed. Wire this into the client terminal
-        loop, replacing the raw byte passthrough.
+        Update the renderer to draw multiple pane screen buffers at their layout
+        positions, draw pane borders with Unicode box-drawing characters, and
+        highlight the active pane border. Update the client terminal loop to
+        manage multiple ScreenBuffers and route output by pane_id.
       </description>
 
       <files>
         <create>
-          cmux-client/src/renderer.rs           (crossterm-based differential renderer)
+          cmux-client/src/pane_manager.rs       (manages per-pane screen buffers + layout)
         </create>
         <modify>
-          cmux-client/Cargo.toml                (add cmux-core dependency, unicode-width)
-          cmux-client/src/terminal.rs           (replace raw passthrough with screen+renderer)
-          cmux-client/src/main.rs               (add mod renderer)
+          cmux-client/src/renderer.rs           (multi-pane render_full/render_diff + border drawing)
+          cmux-client/src/terminal.rs           (use PaneManager, route output by pane_id)
         </modify>
       </files>
 
       <action>
-        1. Add cmux-core dependency to cmux-client/Cargo.toml:
-           ```toml
-           cmux-core = { workspace = true }
-           unicode-width = "0.2"
-           ```
+        1. Create cmux-client/src/pane_manager.rs:
 
-        2. Create cmux-client/src/renderer.rs:
-
-           a) Renderer struct:
-              - prev_snapshot: Option&lt;ScreenSnapshot&gt;
-              - pub fn new() -> Self
-
-           b) pub fn render_full(&amp;mut self, screen: &amp;ScreenBuffer, out: &amp;mut impl Write) -> io::Result&lt;()&gt;
-              * Full redraw of the entire screen
-              * Hide cursor during draw
-              * For each row/col: position cursor, set colors+attributes, write character
-              * Restore cursor position and visibility
-              * Save snapshot as prev_snapshot
-
-           c) pub fn render_diff(&amp;mut self, screen: &amp;ScreenBuffer, out: &amp;mut impl Write) -> io::Result&lt;()&gt;
-              * Take new snapshot
-              * If no prev_snapshot, fall back to render_full
-              * Compute diff between prev and new snapshots
-              * Hide cursor during draw
-              * For each changed cell: position cursor, set colors+attributes, write character
-              * Update cursor position and visibility
-              * Save new snapshot
-
-           d) Helper: fn emit_cell(out, row, col, cell: &amp;CellInfo) -> io::Result&lt;()&gt;
-              * crossterm::cursor::MoveTo(col, row)
-              * crossterm::style::SetForegroundColor(convert_color(cell.fg))
-              * crossterm::style::SetBackgroundColor(convert_color(cell.bg))
-              * Set attributes: Bold, Italic, Underlined, Reverse
-              * crossterm::style::Print(&amp;cell.contents)
-              * crossterm::style::ResetColor (after)
-
-           e) fn convert_color(color: Color) -> crossterm::style::Color
-              * Color::Default -> crossterm::style::Color::Reset
-              * Color::Idx(n) -> crossterm::style::Color::AnsiValue(n)
-              * Color::Rgb(r,g,b) -> crossterm::style::Color::Rgb { r, g, b }
-
-           f) Optimization: batch crossterm commands using crossterm::queue! macro
-              instead of execute! to reduce syscalls. Flush once at the end.
-
-           g) Handle wide characters: if a cell is the continuation of a wide char
-              (vt100 reports empty string for continuation cells), skip it.
-
-        3. Modify cmux-client/src/terminal.rs:
+           - PaneManager struct:
+             * layout: LayoutEngine
+             * screens: HashMap&lt;PaneId, ScreenBuffer&gt;
            
-           a) Add ScreenBuffer and Renderer to run_terminal:
-              ```rust
-              let mut screen = ScreenBuffer::new(rows, cols);
+           - pub fn new(rows: u16, cols: u16) -> Self
+             * Creates LayoutEngine, initial ScreenBuffer for pane 0
+
+           - pub fn process_output(&amp;mut self, pane_id: PaneId, data: &amp;[u8])
+             * Find ScreenBuffer for pane_id, call process()
+
+           - pub fn split(&amp;mut self, direction: SplitDirection) -> PaneId
+             * Call layout.split(direction)
+             * Get new pane rect from layout
+             * Create new ScreenBuffer with pane's dimensions
+             * Resize existing panes to match new layout rects
+             * Return new PaneId
+
+           - pub fn close_pane(&amp;mut self, pane_id: PaneId) -> bool
+             * Call layout.close_pane()
+             * Remove ScreenBuffer for pane_id
+             * Resize remaining panes to match new layout
+             * Return success
+
+           - pub fn resize_terminal(&amp;mut self, rows: u16, cols: u16)
+             * layout.resize_terminal(rows, cols)
+             * Resize all ScreenBuffers to match new rects
+
+           - Delegate: navigate, cycle_pane, resize_pane, toggle_zoom, active_pane, etc.
+
+           - pub fn layout(&amp;self) -> &amp;LayoutEngine
+
+           - pub fn snapshots(&amp;self) -> HashMap&lt;PaneId, ScreenSnapshot&gt;
+             * Snapshot each screen buffer
+
+        2. Update cmux-client/src/renderer.rs:
+
+           a) Change render_full signature:
+              ```
+              pub fn render_full_composite(
+                  &amp;mut self,
+                  snapshots: &amp;HashMap&lt;PaneId, ScreenSnapshot&gt;,
+                  layout: &amp;LayoutEngine,
+                  active_pane: PaneId,
+                  out: &amp;mut W,
+              )
+              ```
+              * Clear screen
+              * For each pane rect in layout:
+                - Get snapshot for pane_id
+                - For each cell: emit at (rect.row + cell_row, rect.col + cell_col)
+              * Draw borders from layout.border_cells()
+              * Highlight active pane border (use brighter color or bold)
+              * Position cursor at active pane's cursor position + offset
+              * Show/hide cursor based on active pane
+
+           b) Change render_diff to render_diff_composite with same signature pattern:
+              * Compare per-pane snapshots against previous
+              * Only redraw cells that changed, with pane offset
+              * Redraw borders if layout changed
+              * Update cursor position for active pane
+
+           c) Border rendering helper:
+              - fn draw_borders(out, layout, active_pane)
+              - Active pane border in green/highlight, others in default/gray
+              - Use box-drawing characters from layout.border_cells()
+
+           d) Keep the old render_full/render_diff for backward compatibility (or remove if unused)
+
+        3. Update cmux-client/src/terminal.rs:
+
+           a) Replace single ScreenBuffer + Renderer with PaneManager:
+              ```
+              let mut panes = PaneManager::new(rows, cols);
               let mut renderer = Renderer::new();
               ```
 
-           b) Replace the raw byte passthrough:
-              OLD:
-              ```rust
-              Ok(Some(ServerMessage::PaneOutput { data, .. })) => {
-                  let mut stdout = std::io::stdout().lock();
-                  stdout.write_all(&data)?;
-                  stdout.flush()?;
-              }
+           b) Route PaneOutput by pane_id:
               ```
-              NEW:
-              ```rust
-              Ok(Some(ServerMessage::PaneOutput { data, .. })) => {
-                  screen.process(&data);
-                  let mut stdout = std::io::stdout().lock();
-                  renderer.render_diff(&screen, &mut stdout)?;
-                  stdout.flush()?;
+              Ok(Some(ServerMessage::PaneOutput { pane_id, data })) => {
+                  panes.process_output(PaneId(pane_id), &amp;data);
+                  let snapshots = panes.snapshots();
+                  renderer.render_diff_composite(
+                      &amp;snapshots, panes.layout(), panes.layout().active_pane(), &amp;mut stdout
+                  )?;
               }
               ```
 
-           c) Handle resize events:
-              ```rust
-              Some(Ok(Event::Resize(cols, rows))) => {
-                  screen.resize(rows, cols);
-                  let mut stdout = std::io::stdout().lock();
-                  renderer.render_full(&screen, &mut stdout)?;
-                  stdout.flush()?;
-                  // TODO Phase 4: send resize to daemon
+           c) Route input to active pane:
+              ```
+              let msg = ClientMessage::PaneInput {
+                  pane_id: panes.layout().active_pane().0,
+                  data: bytes,
+              };
+              ```
+
+           d) Handle resize:
+              ```
+              Some(Ok(Event::Resize(new_cols, new_rows))) => {
+                  panes.resize_terminal(new_rows, new_cols);
+                  renderer.render_full_composite(...)?;
               }
               ```
 
-           d) Do a full render on initial connect (after receiving SessionCreated).
-
-        4. Add `mod renderer;` to cmux-client/src/main.rs.
-
-        IMPORTANT NOTES:
-        - Use crossterm::queue! not execute! for batched writes
-        - Reset attributes before each cell to avoid attribute leaking
-        - Handle the case where vt100 cell contents is empty (space) or multi-byte
-        - The cursor position from screen buffer is relative to the pane, which for
-          Phase 2 (single pane) maps 1:1 to terminal coordinates
+        4. Add `mod pane_manager;` to cmux-client/src/main.rs
       </action>
 
       <verification>
         <command>cargo build --workspace</command>
         <command>cargo clippy --workspace</command>
         <command>cargo fmt --all --check</command>
-        <manual>
-          1. Start daemon: cargo run -p cmux-daemon
-          2. Start client: cargo run -p cmux-client -- new -s test
-          3. Verify: shell prompt renders with correct colors
-          4. Run `dir` or `ls` — verify colored output
-          5. Run a command with bold/underline output
-          6. Resize the terminal window — verify re-render
-          7. Exit client — verify terminal restores correctly
-        </manual>
-      </verification>
-
-      <done>
-        - Renderer draws screen buffer to terminal using crossterm
-        - Differential rendering only redraws changed cells
-        - Colors (true color, 256, 16) render correctly
-        - Bold, italic, underline, inverse attributes render correctly
-        - Cursor position and visibility are correct
-        - Terminal resize triggers full re-render at new dimensions
-        - Wide characters and Unicode render correctly
-        - No flickering on normal output
-        - Terminal restores cleanly on exit
-      </done>
-    </task>
-
-    <task id="3" type="test" complete="false">
-      <name>Unit tests for screen buffer and rendering</name>
-      <description>
-        Write unit tests verifying VT sequence parsing, color handling, attribute
-        rendering, screen diffing, and alternate screen buffer support.
-      </description>
-
-      <files>
-        <create>
-          cmux-core/src/screen/tests.rs         (or inline #[cfg(test)] mod)
-        </create>
-      </files>
-
-      <action>
-        Write tests covering:
-
-        1. Basic text processing:
-           - Process "hello" → cell_at(0,0) = 'h', cell_at(0,4) = 'o'
-           - Process "line1\r\nline2" → correct two-line layout
-
-        2. Color parsing:
-           - Process "\x1b[31mred\x1b[0m" → cell_at fg = Color::Idx(1)
-           - Process "\x1b[38;5;208morange\x1b[0m" → cell_at fg = Color::Idx(208)
-           - Process "\x1b[38;2;255;128;0mtrue\x1b[0m" → cell_at fg = Color::Rgb(255,128,0)
-           - Process "\x1b[44mblue_bg\x1b[0m" → cell_at bg = Color::Idx(4)
-
-        3. SGR attributes:
-           - Process "\x1b[1mbold\x1b[0m" → cell bold = true
-           - Process "\x1b[3mitalic\x1b[0m" → cell italic = true
-           - Process "\x1b[4munderline\x1b[0m" → cell underline = true
-           - Process "\x1b[7minverse\x1b[0m" → cell inverse = true
-           - Reset: after \x1b[0m all attributes are false
-
-        4. Cursor position:
-           - Process text → cursor_position() returns correct (row, col)
-           - Process "\x1b[5;10H" → cursor at (4, 9) (0-indexed)
-           - Process "\x1b[?25l" → cursor_visible() = false
-
-        5. Screen operations:
-           - Process "\x1b[2J" (clear screen) → all cells empty
-           - Process "\x1b[K" (clear to end of line) → rest of line empty
-
-        6. Alternate screen:
-           - Process "\x1b[?1049h" → alternate_screen_active() = true
-           - Process "\x1b[?1049l" → alternate_screen_active() = false
-
-        7. Snapshot and diff:
-           - Take snapshot, process more text, take second snapshot
-           - diff() returns only the cells that changed
-           - Empty diff when nothing changed
-
-        8. Resize:
-           - resize(10, 40) → rows() = 10, cols() = 40
-           - Content preserved after resize (as much as fits)
-      </action>
-
-      <verification>
-        <command>cargo test -p cmux-core</command>
         <command>cargo test --workspace</command>
       </verification>
 
       <done>
-        - All screen buffer unit tests pass
-        - Tests cover: text, colors (16/256/rgb), attributes, cursor, clear, alternate screen
-        - Snapshot diff tests verify correct change detection
-        - Resize tests pass
-        - All previous tests still pass
-        - cargo test --workspace exits 0
+        - Renderer draws multiple panes at correct layout positions
+        - Pane borders drawn with Unicode box-drawing characters
+        - Active pane border highlighted
+        - Cursor positioned correctly within active pane
+        - Terminal resize redistributes pane dimensions
+        - PaneOutput routed to correct pane by pane_id
+        - Input routed to active pane
+        - All tests pass
+      </done>
+    </task>
+
+    <task id="3" type="integration" complete="false">
+      <name>Daemon multi-pane support + IPC commands + basic prefix key</name>
+      <description>
+        Extend the daemon to manage multiple panes per session, add IPC messages
+        for split/close/navigate/resize/zoom, and implement a basic Ctrl+B prefix
+        key in the client to trigger these operations. This makes multi-pane
+        interactive from the user's perspective.
+      </description>
+
+      <files>
+        <modify>
+          cmux-ipc/src/messages.rs              (add SplitPane, ClosePane, Navigate, ResizePane, Zoom, PaneCreated, PaneClosed)
+          cmux-daemon/src/session_manager.rs    (multi-pane: split creates new ConPTY, close kills PTY, per-pane output routing)
+          cmux-daemon/src/server.rs             (handle new message types)
+          cmux-client/src/terminal.rs           (prefix key handler: Ctrl+B then ", %, arrow, x, z, o)
+          cmux-client/src/pane_manager.rs       (handle PaneCreated/PaneClosed from daemon)
+        </modify>
+      </files>
+
+      <action>
+        1. Add new IPC messages to cmux-ipc/src/messages.rs:
+
+           ClientMessage additions:
+           - SplitPane { direction: String }  ("horizontal" or "vertical")
+           - ClosePane { pane_id: u32 }
+           - NavigatePane { direction: String }  ("up", "down", "left", "right")
+           - CyclePane { forward: bool }
+           - ResizePane { direction: String, amount: i16 }
+           - ToggleZoom
+
+           ServerMessage additions:
+           - PaneCreated { pane_id: u32, cols: u16, rows: u16 }
+           - PaneClosed { pane_id: u32 }
+           - LayoutChanged { panes: Vec&lt;PaneLayoutInfo&gt; }
+
+           PaneLayoutInfo struct:
+           - pane_id: u32, row: u16, col: u16, height: u16, width: u16
+
+        2. Update cmux-daemon/src/session_manager.rs:
+
+           - Change ManagedSession to hold multiple panes:
+             * panes: HashMap&lt;u32, Arc&lt;ConPty&gt;&gt;
+             * next_pane_id: u32
+
+           - pub async fn split_pane(&amp;self, session: &amp;str, direction: &amp;str) -> Result&lt;(u32, u16, u16)&gt;
+             * Spawn new ConPTY with pane dimensions (from layout)
+             * Start output reader task for new pane
+             * Return (new_pane_id, cols, rows)
+
+           - pub async fn close_pane(&amp;self, session: &amp;str, pane_id: u32) -> Result&lt;()&gt;
+             * Kill the ConPTY for that pane
+             * Remove from panes map
+
+           - pub async fn send_input(&amp;self, session: &amp;str, pane_id: u32, data: &amp;[u8])
+             * Route input to specific pane's ConPTY (not session-level)
+
+        3. Update cmux-daemon/src/server.rs:
+           - Handle SplitPane: call session_manager.split_pane(), respond with PaneCreated
+           - Handle ClosePane: call session_manager.close_pane(), respond with PaneClosed
+           - Handle NavigatePane/CyclePane/ResizePane/ToggleZoom: respond with Ok
+             (these are client-local layout operations — daemon doesn't need to know the layout,
+              but does need to know which pane gets input)
+
+        4. Update cmux-client/src/terminal.rs with prefix key handler:
+
+           Add PrefixState enum: Normal, WaitingForCommand
+
+           In the key event handler:
+           ```
+           match prefix_state {
+               PrefixState::Normal => {
+                   if ctrl &amp;&amp; key == 'b' {
+                       prefix_state = PrefixState::WaitingForCommand;
+                       continue; // don't forward to PTY
+                   }
+                   // Forward to active pane as before
+               }
+               PrefixState::WaitingForCommand => {
+                   prefix_state = PrefixState::Normal;
+                   match key {
+                       '"' => send SplitPane { direction: "horizontal" }
+                       '%' => send SplitPane { direction: "vertical" }
+                       'x' => send ClosePane { pane_id: active }
+                       'z' => send ToggleZoom, panes.layout_mut().toggle_zoom(), re-render
+                       'o' => panes.layout_mut().cycle_pane(true), re-render
+                       Arrow keys => panes.layout_mut().navigate(...), re-render
+                       _ => {} // unknown prefix command, ignore
+                   }
+               }
+           }
+           ```
+
+           When PaneCreated received from daemon:
+           - Call panes.split(direction) to create local ScreenBuffer + update layout
+           - Full re-render
+
+           When PaneClosed received:
+           - Call panes.close_pane(pane_id)
+           - Full re-render
+
+        5. Update PaneInput routing:
+           - Use active pane from PaneManager instead of hardcoded 0
+      </action>
+
+      <verification>
+        <command>cargo build --workspace</command>
+        <command>cargo clippy --workspace</command>
+        <command>cargo fmt --all --check</command>
+        <command>cargo test --workspace</command>
+        <manual>
+          1. Start daemon, then client with new session
+          2. Press Ctrl+B then % → terminal splits vertically, new shell in right pane
+          3. Press Ctrl+B then " → active pane splits horizontally
+          4. Press Ctrl+B then arrow keys → navigate between panes
+          5. Type in each pane → only active pane receives input
+          6. Press Ctrl+B then z → active pane zooms to full screen
+          7. Press Ctrl+B then z → unzoom, all panes visible again
+          8. Press Ctrl+B then x → close active pane, sibling expands
+          9. Resize terminal → all panes redistribute
+        </manual>
+      </verification>
+
+      <done>
+        - Ctrl+B prefix key triggers split, navigate, zoom, close
+        - Multiple panes each run independent shell processes
+        - Each pane renders its own screen buffer at correct layout position
+        - Pane borders drawn with active pane highlighted
+        - Input routes to active pane only
+        - Pane close removes pane, sibling expands
+        - Zoom temporarily maximizes active pane
+        - All tests pass
       </done>
     </task>
   </tasks>
@@ -351,21 +456,22 @@
       <command>cargo test --workspace</command>
     </commands>
     <manual>
-      1. Start daemon: cargo run -p cmux-daemon
-      2. Start client: cargo run -p cmux-client -- new -s test
-      3. Verify colored output (run a command that produces color)
-      4. Verify cursor positioning works (try arrow keys, backspace)
-      5. Verify resize works (change terminal window size)
-      6. Exit cleanly — terminal restored
+      1. Start daemon + client
+      2. Split panes (Ctrl+B % and Ctrl+B ")
+      3. Navigate between panes (Ctrl+B arrows)
+      4. Type in different panes — verify isolation
+      5. Zoom (Ctrl+B z) and unzoom
+      6. Close pane (Ctrl+B x) — sibling expands
+      7. Resize terminal window — panes redistribute
     </manual>
   </phase_verification>
 
   <completion_criteria>
     <criterion>All 3 tasks marked complete</criterion>
     <criterion>cargo build/clippy/fmt/test all pass</criterion>
-    <criterion>Interactive terminal session renders correctly via crossterm (not raw passthrough)</criterion>
-    <criterion>Colors, attributes, cursor, alternate screen all work</criterion>
-    <criterion>Differential rendering — no full-screen redraw on each output chunk</criterion>
-    <criterion>Terminal resize handled correctly</criterion>
+    <criterion>Multi-pane terminal works interactively</criterion>
+    <criterion>Pane borders rendered with Unicode box-drawing</criterion>
+    <criterion>Active pane highlighted and receives input</criterion>
+    <criterion>Layout engine unit tests comprehensive</criterion>
   </completion_criteria>
 </plan>
