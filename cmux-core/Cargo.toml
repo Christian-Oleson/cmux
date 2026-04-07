@@ -1,0 +1,15 @@
+[package]
+name = "cmux-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+cmux-config = { workspace = true }
+portable-pty = "0.8"
+
+[dev-dependencies]
+serde_json = { workspace = true }

@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = ["cmux-core", "cmux-daemon", "cmux-client", "cmux-ipc", "cmux-config"]
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+thiserror = "2"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+toml = "0.8"
+
+cmux-core = { path = "cmux-core" }
+cmux-ipc = { path = "cmux-ipc" }
+cmux-config = { path = "cmux-config" }
