@@ -1,434 +1,343 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- Dos Apes Super Agent Framework - Phase Plan -->
 <!-- Generated: 2026-04-07 -->
-<!-- Phase: 1 -->
+<!-- Phase: 2 -->
 
 <plan>
   <metadata>
-    <phase>1</phase>
-    <name>Foundation — Cargo Workspace &amp; ConPTY</name>
-    <goal>Establish the Cargo workspace, core types, and prove ConPTY works end-to-end through a daemon/client architecture</goal>
-    <deliverable>A single-pane terminal that spawns PowerShell via ConPTY, relayed through a daemon over Named Pipes to a client that renders output</deliverable>
+    <phase>2</phase>
+    <name>Terminal Emulation &amp; Screen Buffer</name>
+    <goal>Parse VT escape sequences and maintain in-memory screen state per pane, then render via crossterm with differential updates</goal>
+    <deliverable>A single-pane terminal with correct crossterm-based rendering of colors, cursor, Unicode, and alternate screen — replaces raw byte passthrough</deliverable>
     <created>2026-04-07</created>
   </metadata>
 
   <context>
-    <dependencies>None — greenfield Rust project</dependencies>
-    <affected_areas>Entire repo — creates all crate scaffolding from scratch</affected_areas>
+    <dependencies>Phase 1 complete — ConPTY I/O, Named Pipe IPC, daemon/client working</dependencies>
+    <affected_areas>
+      - cmux-core: new screen buffer module
+      - cmux-client: new renderer, modified terminal loop
+      - cmux-daemon: daemon-side screen buffer per pane (for future reattach)
+    </affected_areas>
     <patterns_to_follow>
-      - Cargo workspace with separate library/binary crates
-      - thiserror for library error types, anyhow for binary crates
-      - tokio async runtime for all I/O
-      - tracing macros (info!, debug!, error!) — never println!
-      - serde Serialize/Deserialize on all IPC types
-      - #[cfg(test)] mod tests in each module
+      - vt100 crate handles VT parsing, screen state, colors, attributes, Unicode, alternate screen
+      - crossterm for cursor positioning, color output, attribute rendering
+      - Differential rendering: compare current frame vs previous, only emit crossterm commands for changed cells
+      - Current data flow: daemon sends ServerMessage::PaneOutput { data: Vec&lt;u8&gt; } with raw PTY bytes
+      - Client currently does: stdout.write_all(&amp;data) — this gets replaced with screen.process(&amp;data) + renderer.draw()
     </patterns_to_follow>
   </context>
 
   <tasks>
-    <task id="1" type="setup" complete="false">
-      <name>Cargo workspace, dependencies, and core domain types</name>
+    <task id="1" type="backend" complete="false">
+      <name>Screen buffer module in cmux-core using vt100 crate</name>
       <description>
-        Initialize the Cargo workspace with 5 crates, wire up all dependencies,
-        set up the async runtime and logging, define error types, and create the
-        core domain model (Session, Workspace, Pane, IDs).
+        Create a ScreenBuffer wrapper around the vt100 crate that provides a clean API
+        for processing PTY output, querying cell state, and computing diffs between frames.
+        This module will be used by both the daemon (to maintain pane state) and the client
+        (to parse incoming bytes for rendering).
       </description>
 
       <files>
         <create>
-          Cargo.toml                          (workspace root)
-          cmux-core/Cargo.toml
-          cmux-core/src/lib.rs
-          cmux-core/src/types.rs              (PaneId, SessionId, WorkspaceId, Pane, Session, Workspace structs)
-          cmux-core/src/error.rs              (thiserror enum CmuxError)
-          cmux-daemon/Cargo.toml
-          cmux-daemon/src/main.rs             (tokio::main stub with tracing init)
-          cmux-client/Cargo.toml
-          cmux-client/src/main.rs             (tokio::main stub with tracing init)
-          cmux-ipc/Cargo.toml
-          cmux-ipc/src/lib.rs
-          cmux-ipc/src/protocol.rs            (JSON-RPC request/response/notification enums)
-          cmux-ipc/src/messages.rs            (concrete message types: CreateSession, ListSessions, etc.)
-          cmux-config/Cargo.toml
-          cmux-config/src/lib.rs
-          cmux-config/src/defaults.rs         (default config values)
-          .gitignore                          (Rust template: /target, Cargo.lock for libs)
+          cmux-core/src/screen.rs              (ScreenBuffer wrapper, cell/color/attribute types)
         </create>
+        <modify>
+          cmux-core/Cargo.toml                 (add vt100 dependency)
+          cmux-core/src/lib.rs                 (add pub mod screen)
+        </modify>
       </files>
 
       <action>
-        1. Create workspace Cargo.toml:
+        1. Add `vt100 = "0.15"` to cmux-core/Cargo.toml dependencies.
+
+        2. Create cmux-core/src/screen.rs with:
+
+           a) ScreenBuffer struct wrapping vt100::Parser:
+              - pub fn new(rows: u16, cols: u16) -> Self
+              - pub fn process(&amp;mut self, bytes: &amp;[u8])
+                * Feeds bytes into vt100::Parser
+              - pub fn screen(&amp;self) -> &amp;vt100::Screen
+                * Returns reference to the parsed screen state
+              - pub fn resize(&amp;mut self, rows: u16, cols: u16)
+                * Resizes the internal parser/screen
+              - pub fn cursor_position(&amp;self) -> (u16, u16)
+                * Returns (row, col) of cursor
+              - pub fn cursor_visible(&amp;self) -> bool
+              - pub fn title(&amp;self) -> &amp;str
+              - pub fn alternate_screen_active(&amp;self) -> bool
+
+           b) Helper functions for cell inspection:
+              - pub fn cell_at(&amp;self, row: u16, col: u16) -> Option&lt;CellInfo&gt;
+                * Returns cell character, fg color, bg color, attributes
+              - pub fn rows(&amp;self) -> u16
+              - pub fn cols(&amp;self) -> u16
+
+           c) CellInfo struct (derived from vt100::Cell):
+              - contents: String (the character(s) in this cell)
+              - fg: Color
+              - bg: Color
+              - bold: bool
+              - italic: bool
+              - underline: bool
+              - inverse: bool
+
+           d) Color enum:
+              - Default
+              - Idx(u8) — 0-255 palette
+              - Rgb(u8, u8, u8) — true color
+              
+              * Implement From&lt;vt100::Color&gt; for Color conversion
+
+           e) Snapshot for diffing:
+              - pub fn snapshot(&amp;self) -> ScreenSnapshot
+                * Captures current state (all cells, cursor, title) for later comparison
+              - ScreenSnapshot struct with cells grid, cursor pos, cursor visible, title
+              - pub fn diff(old: &amp;ScreenSnapshot, new: &amp;ScreenSnapshot) -> Vec&lt;CellChange&gt;
+                * Returns list of (row, col, CellInfo) that changed
+
+        3. The vt100 crate handles ALL of the following for us (no manual implementation needed):
+           - VT100/VT220/xterm escape sequence parsing
+           - True color (24-bit), 256-color, 16-color
+           - Unicode/UTF-8, wide characters, combining chars
+           - Alternate screen buffer
+           - SGR attributes (bold, italic, underline, strikethrough, inverse, dim)
+           - Cursor positioning, scrolling, line wrapping
+           - We just need to wrap it with a clean API
+
+        4. Add pub mod screen to cmux-core/src/lib.rs.
+      </action>
+
+      <verification>
+        <command>cargo build -p cmux-core</command>
+        <command>cargo test -p cmux-core</command>
+        <command>cargo clippy -p cmux-core</command>
+      </verification>
+
+      <done>
+        - ScreenBuffer wraps vt100::Parser with clean public API
+        - process() feeds bytes, screen state updates correctly
+        - cell_at() returns character, colors, attributes for any position
+        - snapshot() + diff() produce list of changed cells between frames
+        - resize() works without crashing
+        - All existing tests still pass
+      </done>
+    </task>
+
+    <task id="2" type="backend" complete="false">
+      <name>Crossterm differential renderer + client integration</name>
+      <description>
+        Build a renderer that takes a ScreenBuffer and draws it to the host terminal
+        using crossterm commands. Implements differential rendering by comparing the
+        current screen state against the previously rendered frame and only emitting
+        crossterm commands for cells that changed. Wire this into the client terminal
+        loop, replacing the raw byte passthrough.
+      </description>
+
+      <files>
+        <create>
+          cmux-client/src/renderer.rs           (crossterm-based differential renderer)
+        </create>
+        <modify>
+          cmux-client/Cargo.toml                (add cmux-core dependency, unicode-width)
+          cmux-client/src/terminal.rs           (replace raw passthrough with screen+renderer)
+          cmux-client/src/main.rs               (add mod renderer)
+        </modify>
+      </files>
+
+      <action>
+        1. Add cmux-core dependency to cmux-client/Cargo.toml:
            ```toml
-           [workspace]
-           resolver = "2"
-           members = ["cmux-core", "cmux-daemon", "cmux-client", "cmux-ipc", "cmux-config"]
-           
-           [workspace.dependencies]
-           tokio = { version = "1", features = ["full"] }
-           serde = { version = "1", features = ["derive"] }
-           serde_json = "1"
-           tracing = "0.1"
-           tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-           thiserror = "2"
-           anyhow = "1"
-           clap = { version = "4", features = ["derive"] }
-           toml = "0.8"
+           cmux-core = { workspace = true }
+           unicode-width = "0.2"
            ```
 
-        2. Set up each crate's Cargo.toml with workspace dependency inheritance.
-           - cmux-core: library crate. Depends on tokio, serde, thiserror, tracing.
-           - cmux-ipc: library crate. Depends on serde, serde_json, thiserror.
-           - cmux-config: library crate. Depends on serde, toml, thiserror.
-           - cmux-daemon: binary crate. Depends on cmux-core, cmux-ipc, cmux-config, tokio, tracing, tracing-subscriber, anyhow.
-           - cmux-client: binary crate. Depends on cmux-ipc, tokio, tracing, tracing-subscriber, anyhow, clap.
+        2. Create cmux-client/src/renderer.rs:
 
-        3. Define core types in cmux-core/src/types.rs:
-           - PaneId(u32), SessionId(u32), WorkspaceId(u32) — newtype wrappers with Display, Clone, Copy, Eq, Hash, Serialize, Deserialize
-           - PaneState enum: Running, Exited(i32)
-           - Pane struct: id, pid (Option<u32>), cols, rows, state, title
-           - Workspace struct: id, name, panes (Vec<PaneId>), active_pane (PaneId)
-           - Session struct: id, name, workspaces (Vec<WorkspaceId>), active_workspace (WorkspaceId), created_at
-           - Re-export from cmux-core/src/lib.rs
+           a) Renderer struct:
+              - prev_snapshot: Option&lt;ScreenSnapshot&gt;
+              - pub fn new() -> Self
 
-        4. Define error types in cmux-core/src/error.rs:
-           - CmuxError enum with variants: Pty(String), Ipc(String), Config(String), Io(#[from] std::io::Error), SessionNotFound(String), PaneNotFound(PaneId)
+           b) pub fn render_full(&amp;mut self, screen: &amp;ScreenBuffer, out: &amp;mut impl Write) -> io::Result&lt;()&gt;
+              * Full redraw of the entire screen
+              * Hide cursor during draw
+              * For each row/col: position cursor, set colors+attributes, write character
+              * Restore cursor position and visibility
+              * Save snapshot as prev_snapshot
 
-        5. Define IPC protocol in cmux-ipc/src/protocol.rs:
-           - JsonRpcRequest { jsonrpc: String, method: String, params: serde_json::Value, id: u64 }
-           - JsonRpcResponse { jsonrpc: String, result: Option<serde_json::Value>, error: Option<JsonRpcError>, id: u64 }
-           - JsonRpcError { code: i32, message: String, data: Option<serde_json::Value> }
-           - All derive Serialize, Deserialize, Debug, Clone
+           c) pub fn render_diff(&amp;mut self, screen: &amp;ScreenBuffer, out: &amp;mut impl Write) -> io::Result&lt;()&gt;
+              * Take new snapshot
+              * If no prev_snapshot, fall back to render_full
+              * Compute diff between prev and new snapshots
+              * Hide cursor during draw
+              * For each changed cell: position cursor, set colors+attributes, write character
+              * Update cursor position and visibility
+              * Save new snapshot
 
-        6. Define concrete messages in cmux-ipc/src/messages.rs:
-           - enum ClientMessage: CreateSession { name }, ListSessions, KillSession { name }, Attach { session }, Detach, PaneInput { pane_id, data: Vec<u8> }
-           - enum ServerMessage: SessionCreated { id, name }, SessionList { sessions }, PaneOutput { pane_id, data: Vec<u8> }, Error { message }, Ok
+           d) Helper: fn emit_cell(out, row, col, cell: &amp;CellInfo) -> io::Result&lt;()&gt;
+              * crossterm::cursor::MoveTo(col, row)
+              * crossterm::style::SetForegroundColor(convert_color(cell.fg))
+              * crossterm::style::SetBackgroundColor(convert_color(cell.bg))
+              * Set attributes: Bold, Italic, Underlined, Reverse
+              * crossterm::style::Print(&amp;cell.contents)
+              * crossterm::style::ResetColor (after)
 
-        7. Set up cmux-daemon/src/main.rs:
-           - #[tokio::main] async fn main() -> anyhow::Result<()>
-           - Initialize tracing-subscriber with file appender to %APPDATA%\cmux\cmux.log
-           - Log startup message, return Ok(())
+           e) fn convert_color(color: Color) -> crossterm::style::Color
+              * Color::Default -> crossterm::style::Color::Reset
+              * Color::Idx(n) -> crossterm::style::Color::AnsiValue(n)
+              * Color::Rgb(r,g,b) -> crossterm::style::Color::Rgb { r, g, b }
 
-        8. Set up cmux-client/src/main.rs:
-           - #[tokio::main] async fn main() -> anyhow::Result<()>
-           - Basic clap CLI: subcommands for "new", "attach", "ls", "kill-session" (just parse, don't implement)
-           - Initialize tracing, return Ok(())
+           f) Optimization: batch crossterm commands using crossterm::queue! macro
+              instead of execute! to reduce syscalls. Flush once at the end.
 
-        9. Create .gitignore for Rust.
+           g) Handle wide characters: if a cell is the continuation of a wide char
+              (vt100 reports empty string for continuation cells), skip it.
+
+        3. Modify cmux-client/src/terminal.rs:
+           
+           a) Add ScreenBuffer and Renderer to run_terminal:
+              ```rust
+              let mut screen = ScreenBuffer::new(rows, cols);
+              let mut renderer = Renderer::new();
+              ```
+
+           b) Replace the raw byte passthrough:
+              OLD:
+              ```rust
+              Ok(Some(ServerMessage::PaneOutput { data, .. })) => {
+                  let mut stdout = std::io::stdout().lock();
+                  stdout.write_all(&data)?;
+                  stdout.flush()?;
+              }
+              ```
+              NEW:
+              ```rust
+              Ok(Some(ServerMessage::PaneOutput { data, .. })) => {
+                  screen.process(&data);
+                  let mut stdout = std::io::stdout().lock();
+                  renderer.render_diff(&screen, &mut stdout)?;
+                  stdout.flush()?;
+              }
+              ```
+
+           c) Handle resize events:
+              ```rust
+              Some(Ok(Event::Resize(cols, rows))) => {
+                  screen.resize(rows, cols);
+                  let mut stdout = std::io::stdout().lock();
+                  renderer.render_full(&screen, &mut stdout)?;
+                  stdout.flush()?;
+                  // TODO Phase 4: send resize to daemon
+              }
+              ```
+
+           d) Do a full render on initial connect (after receiving SessionCreated).
+
+        4. Add `mod renderer;` to cmux-client/src/main.rs.
+
+        IMPORTANT NOTES:
+        - Use crossterm::queue! not execute! for batched writes
+        - Reset attributes before each cell to avoid attribute leaking
+        - Handle the case where vt100 cell contents is empty (space) or multi-byte
+        - The cursor position from screen buffer is relative to the pane, which for
+          Phase 2 (single pane) maps 1:1 to terminal coordinates
       </action>
 
       <verification>
         <command>cargo build --workspace</command>
         <command>cargo clippy --workspace</command>
         <command>cargo fmt --all --check</command>
-      </verification>
-
-      <done>
-        - All 5 crates compile cleanly
-        - cargo build --workspace succeeds with no errors
-        - cargo clippy passes (warnings OK for unused code at this stage)
-        - Core types are defined and serializable
-        - IPC protocol types are defined and serializable
-        - Daemon and client binaries start and exit cleanly
-      </done>
-    </task>
-
-    <task id="2" type="backend" complete="false">
-      <name>ConPTY wrapper — spawn, async read/write, resize, close</name>
-      <description>
-        Implement a ConPTY abstraction in cmux-core that can spawn a shell process
-        (PowerShell, cmd.exe) via the Windows ConPTY API, read output asynchronously,
-        write input, resize, and cleanly close. This is the core PTY layer that all
-        panes will use.
-      </description>
-
-      <files>
-        <create>
-          cmux-core/src/pty.rs                (ConPTY wrapper module)
-          cmux-core/src/pty/conpty.rs          (Windows ConPTY implementation using windows-rs)
-        </create>
-        <modify>
-          cmux-core/Cargo.toml                (add windows-rs dependency)
-          cmux-core/src/lib.rs                (add pub mod pty)
-        </modify>
-      </files>
-
-      <action>
-        1. Add windows-rs dependency to cmux-core/Cargo.toml:
-           ```toml
-           [target.'cfg(windows)'.dependencies]
-           windows = { version = "0.61", features = [
-             "Win32_System_Console",
-             "Win32_System_Threading",
-             "Win32_Security",
-             "Win32_Foundation",
-             "Win32_System_Pipes",
-             "Win32_Storage_FileSystem",
-           ]}
-           ```
-
-        2. Implement ConPty struct in cmux-core/src/pty/conpty.rs:
-           
-           Key types:
-           - ConPty struct holding: hpc (HPCON handle), input_write (OwnedHandle), output_read (OwnedHandle), child_process (OwnedHandle), child_thread (OwnedHandle)
-           - ConPtyConfig: initial_cols (u16), initial_rows (u16), shell (String)
-
-           Key methods:
-           - pub fn spawn(config: ConPtyConfig) -> Result<ConPty, CmuxError>
-             * CreatePipe for input (pipe_in_read, pipe_in_write)
-             * CreatePipe for output (pipe_out_read, pipe_out_write)
-             * COORD { X: cols, Y: rows }
-             * CreatePseudoConsole(size, pipe_in_read, pipe_out_write, 0, &mut hpc)
-             * Set up STARTUPINFOEXW with PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE
-             * CreateProcessW to spawn the shell
-             * Close the pipe ends not needed by the parent (pipe_in_read, pipe_out_write)
-             * Return ConPty owning the remaining handles
-
-           - pub async fn read(&self, buf: &mut [u8]) -> Result<usize, CmuxError>
-             * Use tokio::task::spawn_blocking to wrap synchronous ReadFile on output_read
-             * Return bytes read
-
-           - pub async fn write(&self, data: &[u8]) -> Result<usize, CmuxError>
-             * Use tokio::task::spawn_blocking to wrap synchronous WriteFile on input_write
-             * Return bytes written
-
-           - pub fn resize(&self, cols: u16, rows: u16) -> Result<(), CmuxError>
-             * Call ResizePseudoConsole(hpc, COORD { X: cols, Y: rows })
-
-           - pub fn close(self) -> Result<(), CmuxError>
-             * Call ClosePseudoConsole(hpc)
-             * Close all handles (done automatically via Drop on OwnedHandle)
-             * Wait for child process to exit (optional, with timeout)
-
-           - impl Drop for ConPty:
-             * ClosePseudoConsole if not already closed
-             * Log cleanup
-
-        3. Create cmux-core/src/pty.rs as the public module interface:
-           - pub mod conpty;
-           - Re-export ConPty, ConPtyConfig
-
-        4. Wire into cmux-core/src/lib.rs:
-           - pub mod pty;
-           - pub mod types;
-           - pub mod error;
-
-        IMPORTANT NOTES:
-        - ConPTY read is synchronous (ReadFile) — MUST use spawn_blocking to avoid blocking tokio
-        - ConPTY handles have strict ownership — closing pipe_out_write before reading from pipe_out_read is critical
-        - The HPCON handle from CreatePseudoConsole is NOT Send — must be accessed from the thread that created it, or wrapped carefully
-        - Use OwnedHandle from std::os::windows::io for safe RAII handle management
-      </action>
-
-      <verification>
-        <command>cargo build -p cmux-core</command>
-        <command>cargo clippy -p cmux-core</command>
         <manual>
-          Write a quick integration test (or example binary) that:
-          1. Spawns ConPty with "cmd.exe /c echo hello"
-          2. Reads output until "hello" appears
-          3. Verifies the child exits with code 0
-          4. All handles cleaned up (no leaks)
+          1. Start daemon: cargo run -p cmux-daemon
+          2. Start client: cargo run -p cmux-client -- new -s test
+          3. Verify: shell prompt renders with correct colors
+          4. Run `dir` or `ls` — verify colored output
+          5. Run a command with bold/underline output
+          6. Resize the terminal window — verify re-render
+          7. Exit client — verify terminal restores correctly
         </manual>
       </verification>
 
       <done>
-        - ConPty::spawn() successfully creates a pseudoconsole and spawns PowerShell/cmd
-        - Async read() returns output bytes from the shell
-        - Async write() sends input bytes to the shell
-        - resize() changes the pseudoconsole dimensions without error
-        - Drop/close cleans up all handles without deadlock
-        - Compiles on Windows (cfg(windows))
+        - Renderer draws screen buffer to terminal using crossterm
+        - Differential rendering only redraws changed cells
+        - Colors (true color, 256, 16) render correctly
+        - Bold, italic, underline, inverse attributes render correctly
+        - Cursor position and visibility are correct
+        - Terminal resize triggers full re-render at new dimensions
+        - Wide characters and Unicode render correctly
+        - No flickering on normal output
+        - Terminal restores cleanly on exit
       </done>
     </task>
 
-    <task id="3" type="backend" complete="false">
-      <name>Named Pipe IPC, daemon server, and client connector</name>
+    <task id="3" type="test" complete="false">
+      <name>Unit tests for screen buffer and rendering</name>
       <description>
-        Implement the Named Pipe transport layer, the daemon that listens for connections
-        and manages a ConPTY process, and the client that connects, sends input, and
-        receives output. End result: run cmux-daemon, then cmux-client, and get an
-        interactive single-pane terminal session over IPC.
+        Write unit tests verifying VT sequence parsing, color handling, attribute
+        rendering, screen diffing, and alternate screen buffer support.
       </description>
 
       <files>
         <create>
-          cmux-ipc/src/transport.rs            (Named Pipe read/write helpers — frame-delimited JSON)
-          cmux-daemon/src/server.rs             (Named Pipe listener, connection handler)
-          cmux-daemon/src/session_manager.rs    (manages one session with one pane for now)
-          cmux-client/src/connection.rs          (connect to daemon, send/receive messages)
-          cmux-client/src/terminal.rs            (raw mode, stdin forwarding, stdout rendering)
+          cmux-core/src/screen/tests.rs         (or inline #[cfg(test)] mod)
         </create>
-        <modify>
-          cmux-ipc/src/lib.rs                   (add pub mod transport)
-          cmux-ipc/Cargo.toml                   (add tokio dependency for async pipe I/O)
-          cmux-daemon/src/main.rs               (wire up server and session manager)
-          cmux-client/src/main.rs               (wire up connection and terminal)
-          cmux-daemon/Cargo.toml                (add windows-rs for Named Pipes)
-          cmux-client/Cargo.toml                (add crossterm, windows-rs)
-        </modify>
       </files>
 
       <action>
-        1. Implement frame-delimited transport in cmux-ipc/src/transport.rs:
-           - Messages are length-prefixed: 4-byte little-endian u32 length, then JSON bytes
-           - async fn write_message(pipe: &mut impl AsyncWrite, msg: &impl Serialize) -> Result<()>
-           - async fn read_message<T: DeserializeOwned>(pipe: &mut impl AsyncRead) -> Result<T>
-           - This is transport-agnostic (works over any AsyncRead/AsyncWrite)
+        Write tests covering:
 
-        2. Implement daemon server in cmux-daemon/src/server.rs:
-           - Use tokio::net::windows::named_pipe::ServerOptions to create pipe at \\.\pipe\cmux
-           - Listen loop: accept connection, spawn tokio task per client
-           - Per-client task reads ClientMessage, dispatches to session_manager, sends ServerMessage back
-           - For PaneInput: forward bytes to ConPTY write
-           - For CreateSession: spawn ConPTY, start output reader task
-           - Output reader task: continuously read from ConPTY, broadcast PaneOutput to connected clients
+        1. Basic text processing:
+           - Process "hello" → cell_at(0,0) = 'h', cell_at(0,4) = 'o'
+           - Process "line1\r\nline2" → correct two-line layout
 
-        3. Implement session manager in cmux-daemon/src/session_manager.rs:
-           - SessionManager struct: holds one Session with one Pane (expand in Phase 4)
-           - create_session(name, shell) -> spawns ConPTY, stores Pane
-           - handle_input(pane_id, data) -> forwards to ConPTY write
-           - subscribe_output() -> returns a tokio::sync::broadcast::Receiver<PaneOutput>
-           - Uses Arc<Mutex<...>> or actor pattern with mpsc channels for thread-safe access
+        2. Color parsing:
+           - Process "\x1b[31mred\x1b[0m" → cell_at fg = Color::Idx(1)
+           - Process "\x1b[38;5;208morange\x1b[0m" → cell_at fg = Color::Idx(208)
+           - Process "\x1b[38;2;255;128;0mtrue\x1b[0m" → cell_at fg = Color::Rgb(255,128,0)
+           - Process "\x1b[44mblue_bg\x1b[0m" → cell_at bg = Color::Idx(4)
 
-        4. Wire up cmux-daemon/src/main.rs:
-           - Parse optional CLI args (--pipe-name for custom pipe path)
-           - Create SessionManager
-           - Start server listening loop
-           - On SIGTERM/Ctrl+C: graceful shutdown (close ConPTY, close pipe)
-           - Log all lifecycle events with tracing
+        3. SGR attributes:
+           - Process "\x1b[1mbold\x1b[0m" → cell bold = true
+           - Process "\x1b[3mitalic\x1b[0m" → cell italic = true
+           - Process "\x1b[4munderline\x1b[0m" → cell underline = true
+           - Process "\x1b[7minverse\x1b[0m" → cell inverse = true
+           - Reset: after \x1b[0m all attributes are false
 
-        5. Implement client connection in cmux-client/src/connection.rs:
-           - Connect to \\.\pipe\cmux using tokio::net::windows::named_pipe::ClientOptions
-           - Provide send(ClientMessage) and recv() -> ServerMessage methods
-           - Handle connection errors (daemon not running, pipe busy)
+        4. Cursor position:
+           - Process text → cursor_position() returns correct (row, col)
+           - Process "\x1b[5;10H" → cursor at (4, 9) (0-indexed)
+           - Process "\x1b[?25l" → cursor_visible() = false
 
-        6. Implement client terminal in cmux-client/src/terminal.rs:
-           - Enter raw mode via crossterm::terminal::enable_raw_mode()
-           - Spawn stdin reader task: read crossterm Events, convert keypresses to PaneInput messages, send to daemon
-           - Spawn output renderer task: receive PaneOutput from daemon, write raw bytes to stdout
-           - On disconnect/exit: restore terminal (disable_raw_mode, show cursor)
-           - Handle Ctrl+C cleanly (exit raw mode before terminating)
+        5. Screen operations:
+           - Process "\x1b[2J" (clear screen) → all cells empty
+           - Process "\x1b[K" (clear to end of line) → rest of line empty
 
-        7. Wire up cmux-client/src/main.rs:
-           - Subcommand "new -s <name>": connect to daemon, send CreateSession, enter terminal loop
-           - If daemon not running: print error "cmux daemon not running. Start with: cmux-daemon"
-           - Subcommand "ls": connect, send ListSessions, print result, exit
+        6. Alternate screen:
+           - Process "\x1b[?1049h" → alternate_screen_active() = true
+           - Process "\x1b[?1049l" → alternate_screen_active() = false
 
-        IMPORTANT NOTES:
-        - Named Pipe on Windows requires specific access modes — use PIPE_ACCESS_DUPLEX
-        - tokio::net::windows::named_pipe requires tokio "net" feature
-        - The daemon must handle multiple clients but Phase 1 only needs one at a time
-        - Use broadcast channel for ConPTY output so multiple clients could subscribe (future-proof)
-        - The client terminal must restore raw mode on ANY exit path (panic, error, normal) — use a Drop guard
+        7. Snapshot and diff:
+           - Take snapshot, process more text, take second snapshot
+           - diff() returns only the cells that changed
+           - Empty diff when nothing changed
+
+        8. Resize:
+           - resize(10, 40) → rows() = 10, cols() = 40
+           - Content preserved after resize (as much as fits)
       </action>
 
       <verification>
-        <command>cargo build --workspace</command>
-        <command>cargo clippy --workspace</command>
-        <manual>
-          1. Open terminal A: cargo run -p cmux-daemon
-             - Should print "cmux daemon started, listening on \\.\pipe\cmux"
-          2. Open terminal B: cargo run -p cmux-client -- new -s test
-             - Should connect to daemon, create ConPTY with default shell
-             - Should see PowerShell prompt
-             - Typing commands should work (dir, echo hello)
-             - Output should render correctly
-          3. Close client (Ctrl+C or exit shell)
-             - Client terminal should restore properly
-             - Daemon should log client disconnect, ConPTY cleanup
-          4. Daemon should remain running for next client
-        </manual>
-      </verification>
-
-      <done>
-        - Daemon starts, listens on Named Pipe, and logs startup
-        - Client connects to daemon, creates a session, and enters interactive terminal mode
-        - Keystrokes flow from client -> daemon -> ConPTY -> shell
-        - Shell output flows from ConPTY -> daemon -> client -> stdout
-        - Client terminal restores cleanly on exit
-        - Daemon survives client disconnect and accepts new connections
-        - All IPC uses length-prefixed JSON framing
-      </done>
-    </task>
-
-    <task id="4" type="test" complete="false">
-      <name>Unit and integration tests for ConPTY and IPC</name>
-      <description>
-        Write unit tests for core types, IPC serialization, and ConPTY lifecycle.
-        Write an integration test that exercises the daemon-client round-trip
-        programmatically (no manual terminal interaction).
-      </description>
-
-      <files>
-        <create>
-          cmux-core/src/pty/tests.rs           (ConPTY unit/integration tests)
-          cmux-ipc/src/protocol_tests.rs       (JSON-RPC serialization tests)
-          cmux-ipc/src/transport_tests.rs       (frame-delimited transport tests)
-          cmux-core/tests/conpty_integration.rs (integration test: spawn, read, write, close)
-        </create>
-        <modify>
-          cmux-core/src/pty/conpty.rs          (add #[cfg(test)] mod tests)
-          cmux-ipc/src/protocol.rs             (add #[cfg(test)] mod tests)
-        </modify>
-      </files>
-
-      <action>
-        1. IPC protocol serialization tests (cmux-ipc/src/protocol.rs #[cfg(test)]):
-           - Test JsonRpcRequest serializes to valid JSON-RPC 2.0 format
-           - Test JsonRpcResponse with result and with error
-           - Test ClientMessage enum round-trips (serialize then deserialize)
-           - Test ServerMessage enum round-trips
-           - Test edge cases: empty params, large payloads, Unicode in strings
-
-        2. Transport layer tests (cmux-ipc/src/transport_tests.rs):
-           - Use tokio::io::duplex() to create an in-memory pipe
-           - Test write_message + read_message round-trip
-           - Test multiple messages in sequence
-           - Test large message (simulate big PaneOutput)
-           - Test malformed length prefix (should return error, not panic)
-
-        3. Core types tests (cmux-core/src/types.rs #[cfg(test)]):
-           - Test PaneId, SessionId Display formatting
-           - Test Pane, Session, Workspace construction and serde round-trip
-           - Test PaneState enum variants
-
-        4. ConPTY integration tests (cmux-core/tests/conpty_integration.rs):
-           - #[tokio::test] async fn test_spawn_and_read_output()
-             * Spawn ConPty with "cmd.exe /c echo hello_cmux_test"
-             * Read output in a loop until "hello_cmux_test" found or timeout (5s)
-             * Assert output contains "hello_cmux_test"
-           
-           - #[tokio::test] async fn test_write_input()
-             * Spawn ConPty with "cmd.exe"
-             * Write "echo test_input_works\r\n"
-             * Read until "test_input_works" appears in output
-             * Write "exit\r\n" to close
-           
-           - #[tokio::test] async fn test_resize()
-             * Spawn ConPty with 80x24
-             * Resize to 120x40
-             * Verify no error (visual verification is Phase 2)
-           
-           - #[tokio::test] async fn test_close_cleanup()
-             * Spawn ConPty
-             * Drop/close it
-             * Verify no panic, no handle leak (process exits)
-
-        5. All tests must use #[cfg(windows)] since ConPTY is Windows-only.
-        6. Use tokio::time::timeout to prevent hanging tests.
-      </action>
-
-      <verification>
+        <command>cargo test -p cmux-core</command>
         <command>cargo test --workspace</command>
-        <command>cargo test -p cmux-ipc -- --nocapture</command>
-        <command>cargo test -p cmux-core -- --nocapture</command>
       </verification>
 
       <done>
-        - All IPC serialization tests pass
-        - Transport frame tests pass with in-memory pipes
-        - ConPTY spawn/read/write/resize/close tests pass on Windows
-        - No tests hang (all have timeouts)
+        - All screen buffer unit tests pass
+        - Tests cover: text, colors (16/256/rgb), attributes, cursor, clear, alternate screen
+        - Snapshot diff tests verify correct change detection
+        - Resize tests pass
+        - All previous tests still pass
         - cargo test --workspace exits 0
       </done>
     </task>
@@ -437,27 +346,26 @@
   <phase_verification>
     <commands>
       <command>cargo build --workspace</command>
-      <command>cargo clippy --workspace -- -D warnings</command>
+      <command>cargo clippy --workspace</command>
       <command>cargo fmt --all --check</command>
       <command>cargo test --workspace</command>
     </commands>
     <manual>
       1. Start daemon: cargo run -p cmux-daemon
-      2. In another terminal: cargo run -p cmux-client -- new -s test
-      3. Verify interactive PowerShell session works (type commands, see output)
-      4. Exit client, verify daemon stays running
-      5. Reconnect with: cargo run -p cmux-client -- new -s test2
-      6. Verify second session works
+      2. Start client: cargo run -p cmux-client -- new -s test
+      3. Verify colored output (run a command that produces color)
+      4. Verify cursor positioning works (try arrow keys, backspace)
+      5. Verify resize works (change terminal window size)
+      6. Exit cleanly — terminal restored
     </manual>
   </phase_verification>
 
   <completion_criteria>
-    <criterion>All 4 tasks marked complete</criterion>
+    <criterion>All 3 tasks marked complete</criterion>
     <criterion>cargo build/clippy/fmt/test all pass</criterion>
-    <criterion>Interactive single-pane terminal works end-to-end (daemon + client)</criterion>
-    <criterion>ConPTY spawns PowerShell and relays I/O correctly</criterion>
-    <criterion>Named Pipe IPC with JSON framing works</criterion>
-    <criterion>No TODO comments left in new code</criterion>
-    <criterion>All handles cleaned up — no resource leaks on exit</criterion>
+    <criterion>Interactive terminal session renders correctly via crossterm (not raw passthrough)</criterion>
+    <criterion>Colors, attributes, cursor, alternate screen all work</criterion>
+    <criterion>Differential rendering — no full-screen redraw on each output chunk</criterion>
+    <criterion>Terminal resize handled correctly</criterion>
   </completion_criteria>
 </plan>

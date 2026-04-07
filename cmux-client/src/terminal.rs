@@ -1,8 +1,9 @@
+use crate::renderer::Renderer;
+use cmux_core::screen::ScreenBuffer;
 use cmux_ipc::messages::{ClientMessage, ServerMessage};
 use cmux_ipc::transport;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
-use std::io::Write;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_stream::StreamExt;
 use tracing::debug;
@@ -20,10 +21,10 @@ impl RawModeGuard {
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        // Show cursor in case it was hidden
         let _ = crossterm::execute!(
             std::io::stdout(),
             crossterm::cursor::Show,
+            crossterm::style::ResetColor,
             crossterm::terminal::LeaveAlternateScreen
         );
     }
@@ -41,23 +42,22 @@ where
 {
     let _raw_guard = RawModeGuard::enable()?;
 
-    // Get terminal size and send resize
     let (cols, rows) = crossterm::terminal::size()?;
     debug!(cols, rows, "Terminal size");
+
+    let mut screen = ScreenBuffer::new(rows, cols);
+    let mut renderer = Renderer::new();
 
     let mut event_stream = EventStream::new();
 
     loop {
         tokio::select! {
-            // Read terminal events (keyboard input, resize)
             event = event_stream.next() => {
                 match event {
                     Some(Ok(Event::Key(key_event))) => {
-                        // Check for Ctrl+C to exit
                         if key_event.modifiers.contains(KeyModifiers::CONTROL)
                             && key_event.code == KeyCode::Char('c')
                         {
-                            // Send Ctrl+C to the pane
                             let msg = ClientMessage::PaneInput {
                                 pane_id: 0,
                                 data: vec![0x03],
@@ -71,9 +71,11 @@ where
                             transport::write_message(&mut pipe_writer, &msg).await?;
                         }
                     }
-                    Some(Ok(Event::Resize(cols, rows))) => {
-                        debug!(cols, rows, "Terminal resized");
-                        // TODO: Send resize to daemon in Phase 4
+                    Some(Ok(Event::Resize(new_cols, new_rows))) => {
+                        debug!(cols = new_cols, rows = new_rows, "Terminal resized");
+                        screen.resize(new_rows, new_cols);
+                        let mut stdout = std::io::stdout().lock();
+                        renderer.render_full(&screen, &mut stdout)?;
                     }
                     Some(Ok(Event::Paste(text))) => {
                         let msg = ClientMessage::PaneInput {
@@ -91,21 +93,18 @@ where
                 }
             }
 
-            // Read output from daemon
             msg = transport::read_message::<_, ServerMessage>(&mut pipe_reader) => {
                 match msg {
                     Ok(Some(ServerMessage::PaneOutput { data, .. })) => {
+                        screen.process(&data);
                         let mut stdout = std::io::stdout().lock();
-                        stdout.write_all(&data)?;
-                        stdout.flush()?;
+                        renderer.render_diff(&screen, &mut stdout)?;
                     }
                     Ok(Some(ServerMessage::Error { message })) => {
                         eprintln!("\r\ncmux error: {message}\r");
                         break;
                     }
-                    Ok(Some(_)) => {
-                        // Ignore other messages during terminal session
-                    }
+                    Ok(Some(_)) => {}
                     Ok(None) => {
                         debug!("Daemon disconnected");
                         break;
@@ -129,7 +128,6 @@ fn key_event_to_bytes(event: &KeyEvent) -> Option<Vec<u8>> {
     match event.code {
         KeyCode::Char(c) => {
             if ctrl {
-                // Ctrl+A = 0x01, Ctrl+B = 0x02, etc.
                 let byte = (c.to_ascii_lowercase() as u8)
                     .wrapping_sub(b'a')
                     .wrapping_add(1);

@@ -10,6 +10,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 cmux-config = { workspace = true }
 portable-pty = "0.8"
+vt100 = "0.15"
 
 [dev-dependencies]
 serde_json = { workspace = true }

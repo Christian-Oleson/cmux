@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 cmux-ipc = { workspace = true }
 cmux-config = { workspace = true }
+cmux-core = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

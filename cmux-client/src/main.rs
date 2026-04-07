@@ -1,4 +1,5 @@
 mod connection;
+mod renderer;
 mod terminal;
 
 use clap::{Parser, Subcommand};
