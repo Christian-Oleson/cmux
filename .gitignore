@@ -1,5 +1,6 @@
 /target
 **/*.rs.bk
+key_dump.log
 *.pdb
 *.exe
 *.dll
