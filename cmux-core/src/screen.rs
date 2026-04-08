@@ -116,6 +116,15 @@ impl ScreenBuffer {
     }
 
     /// Whether the alternate screen buffer is active.
+    /// Return the VT byte stream that reproduces the current screen state.
+    ///
+    /// Used by the daemon to replay pane contents to a (re)attaching client
+    /// so its local [`ScreenBuffer`] can be populated without waiting for
+    /// new output from the shell.
+    pub fn contents_formatted(&self) -> Vec<u8> {
+        self.parser.screen().contents_formatted()
+    }
+
     pub fn alternate_screen_active(&self) -> bool {
         self.screen().alternate_screen()
     }

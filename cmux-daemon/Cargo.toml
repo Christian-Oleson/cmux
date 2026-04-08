@@ -21,6 +21,7 @@ tracing-subscriber = { workspace = true }
 tracing-appender = { workspace = true }
 anyhow = { workspace = true }
 serde_json = { workspace = true }
+dirs = "5"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = [

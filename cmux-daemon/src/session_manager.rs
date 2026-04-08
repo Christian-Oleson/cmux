@@ -294,6 +294,28 @@ impl SessionManager {
         Ok(())
     }
 
+    /// Return the raw VT byte stream that reproduces the current screen
+    /// state of a pane. Used by the server to replay pane contents to a
+    /// (re)attaching client so the client's local ScreenBuffer can be
+    /// populated immediately.
+    pub async fn pane_snapshot_bytes(
+        &self,
+        session_name: &str,
+        pane_id: u32,
+    ) -> Result<Vec<u8>, CmuxError> {
+        let sessions = self.sessions.lock().await;
+        let session = sessions
+            .get(session_name)
+            .ok_or_else(|| CmuxError::SessionNotFound(session_name.into()))?;
+        for ws in session.workspaces.values() {
+            if let Some(pane) = ws.panes.get(&pane_id) {
+                let screen = pane.screen.lock().await;
+                return Ok(screen.contents_formatted());
+            }
+        }
+        Err(CmuxError::PaneNotFound(cmux_core::types::PaneId(pane_id)))
+    }
+
     pub async fn get_session_state(
         &self,
         session_name: &str,
@@ -331,6 +353,22 @@ impl SessionManager {
                 }
             })
             .collect()
+    }
+
+    /// Kill every pane across every session. Used during graceful shutdown
+    /// to ensure no orphaned ConPty child processes remain.
+    pub async fn shutdown_all(&self) {
+        let mut sessions = self.sessions.lock().await;
+        let count = sessions.len();
+        for (name, session) in sessions.drain() {
+            for ws in session.workspaces.values() {
+                for pane in ws.panes.values() {
+                    let _ = pane.pty.kill();
+                }
+            }
+            info!(name = %name, "Session killed during shutdown");
+        }
+        info!(sessions_killed = count, "shutdown_all complete");
     }
 
     pub async fn kill_session(&self, name: &str) -> Result<(), CmuxError> {

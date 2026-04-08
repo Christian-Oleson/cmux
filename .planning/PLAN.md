@@ -1,408 +1,195 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- Dos Apes Super Agent Framework - Phase Plan -->
-<!-- Generated: 2026-04-07 -->
-<!-- Phase: 8 -->
+<!-- Generated: 2026-04-08 -->
+<!-- Phase: 9 -->
 
 <plan>
   <metadata>
-    <phase>8</phase>
-    <name>JSON-RPC API &amp; Agent Integration</name>
-    <goal>Full programmatic JSON-RPC 2.0 API for AI agents to control cmux sessions, workspaces, and panes</goal>
-    <deliverable>AI agents can connect to a dedicated Named Pipe, invoke JSON-RPC methods to create sessions, send text/keys, read pane output, and subscribe to events</deliverable>
-    <created>2026-04-07</created>
+    <phase>9</phase>
+    <name>CLI Polish, Error Handling &amp; Distribution</name>
+    <goal>Fix the interactive client's Windows input/rendering bugs, complete the CLI, add structured logging, ship a release build with a proper README</goal>
+    <deliverable>A shippable v1.0 binary where both the interactive client AND the JSON-RPC API are usable, with a README, CI, and release artifacts</deliverable>
+    <created>2026-04-08</created>
   </metadata>
 
   <context>
-    <dependencies>Phase 7 complete — JsonRpcRequest/Response types exist (cmux-ipc/src/protocol.rs), session manager has workspace/pane operations, transport layer for length-prefixed framing</dependencies>
+    <dependencies>Phase 8 complete — all runtime features present, 168 tests, JSON-RPC API working end-to-end</dependencies>
     <affected_areas>
-      - cmux-ipc/src/protocol.rs: already has JSON-RPC 2.0 types (unused since Phase 1) — now wire them up
-      - cmux-daemon/src/jsonrpc.rs (new): method dispatcher, handlers for session.*/workspace.*/surface.*/notify.*
-      - cmux-daemon/src/rpc_server.rs (new): dedicated Named Pipe listener for JSON-RPC clients
-      - cmux-daemon/src/main.rs: start both the interactive server AND the RPC server in parallel
-      - cmux-daemon/src/session_manager.rs: may need new methods for read_output (screen content), send_key
-      - cmux-config/src/defaults.rs: add RPC pipe name constant
+      - cmux-client: MAJOR — fix Windows key input handling, add alternate screen buffer, handle reattach screen state
+      - cmux-daemon: send pane screen snapshots on attach (currently only sends workspace structure)
+      - cmux-daemon/src/main.rs: graceful shutdown, structured file logging
+      - cmux-client/src/main.rs: more CLI subcommands (detach, list-panes, list-windows, rename, display-message)
+      - .github/workflows/: CI + release workflows
+      - README.md: user-facing documentation
+      - cmux-client/src/terminal.rs: REMOVE the debug_key_log scaffolding added during Phase 8 debugging
     </affected_areas>
     <patterns_to_follow>
-      - Separate pipe for RPC (\\.\pipe\cmux-rpc) — keeps interactive client protocol untouched
-      - JSON-RPC 2.0 compliant: method, params, id, result/error
-      - Method names use dot notation: "session.create", "surface.send_text"
-      - Errors use standard JSON-RPC error codes (-32600 invalid request, -32601 method not found, -32602 invalid params, -32000+ server errors)
-      - Notifications (request with no id field) used for event streams — agent subscribes, daemon pushes
-      - Transport: existing length-prefixed JSON framing from cmux-ipc/src/transport.rs
-      - Concurrent clients: each pipe connection spawns a tokio task, dispatcher uses Arc&lt;SessionManager&gt; + Mutex already in place
+      - The interactive client is the user-facing pain point from Phase 8 — take it seriously with a diagnostic-first approach
+      - JSON-RPC path is already tested and working — do not break it
+      - "Done" for Phase 9 means a user can run `cmux-daemon` + `cmux-client new -s main` in Windows Terminal/PowerShell and get a working multiplexer, OR use the JSON-RPC API from a script
+      - Deferred features (.msi installer, session persistence across daemon restarts, OSC notifications, prefix+: command mode) are NOT in scope for Phase 9 — they're post-v1.0 polish
     </patterns_to_follow>
   </context>
 
   <tasks>
     <task id="1" type="backend" complete="false">
-      <name>JSON-RPC dispatcher with session, workspace, surface, and notify methods</name>
+      <name>Diagnostic-first fix of the interactive client's Windows input + rendering</name>
       <description>
-        Create a method dispatcher that maps JsonRpcRequest to SessionManager operations
-        and returns structured JsonRpcResponse. Implement all core methods: session.*
-        (create/list/kill), workspace.* (create/close/switch/list), surface.* (split/
-        send_text/send_key/read_output/resize/close/list), and notify.send.
+        The blocker from Phase 8 user testing: pressing Ctrl+B in the interactive
+        client did not trigger prefix mode, and on reattach the screen showed
+        stale/garbled content because the daemon doesn't replay screen state.
+        This task fixes all of it with a diagnostic-first approach: build a
+        minimal crossterm event dumper to identify what Windows is actually
+        sending, then fix the client based on real data.
       </description>
 
       <files>
         <create>
-          cmux-daemon/src/jsonrpc.rs            (method dispatcher + all method handlers)
+          cmux-client/examples/key_dump.rs      (minimal standalone crossterm event logger)
         </create>
         <modify>
-          cmux-daemon/src/session_manager.rs    (add read_output + list_all_panes methods)
-          cmux-daemon/src/main.rs                (add mod jsonrpc)
-          cmux-config/src/defaults.rs            (add RPC_PIPE_NAME constant)
-        </modify>
+          cmux-client/src/terminal.rs           (remove debug_key_log, add alternate screen buffer, improve input handling based on diagnostic findings)
+          cmux-client/src/pane_manager.rs       (remove #[allow(dead_code)] fallout, clean up any Phase 6-8 dead code)
+          cmux-daemon/src/session_manager.rs    (add read_pane_snapshot returning ScreenSnapshot bytes for replay)
+          cmux-daemon/src/server.rs             (on Attach, send pane snapshots as synthesized PaneOutput messages so client's local screen buffers get populated)
+          cmux-ipc/src/messages.rs              (optionally add PaneSnapshot message variant — OR just reuse PaneOutput with the raw VT stream)
+        </create>
       </files>
 
       <action>
-        1. Add to cmux-config/src/defaults.rs:
-           ```rust
-           /// Named pipe path for JSON-RPC API.
-           pub const RPC_PIPE_NAME: &amp;str = r"\\.\pipe\cmux-rpc";
-           ```
+        **PART A — Diagnostic: build a standalone key dumper**
 
-        2. Add to cmux-daemon/src/session_manager.rs:
-           - Need a way to get screen content for a pane. We don't currently track
-             a ScreenBuffer in the daemon — PTYs just stream bytes to clients.
-             For Phase 8, we add a lightweight ScreenBuffer per pane in the daemon:
-             
-             Modify ManagedPane to hold an Arc&lt;Mutex&lt;ScreenBuffer&gt;&gt;:
-             ```rust
-             struct ManagedPane {
-                 pty: Arc&lt;ConPty&gt;,
-                 screen: Arc&lt;tokio::sync::Mutex&lt;cmux_core::screen::ScreenBuffer&gt;&gt;,
-             }
-             ```
-           
-           - Update spawn_pane_reader to feed bytes into the screen buffer:
-             ```rust
-             fn spawn_pane_reader(
-                 pty: Arc&lt;ConPty&gt;,
-                 screen: Arc&lt;Mutex&lt;ScreenBuffer&gt;&gt;,
-                 pane_id: u32,
-                 tx: broadcast::Sender&lt;ServerMessage&gt;,
-             ) {
-                 // After reading bytes, also call screen.lock().await.process(&amp;buf[..n])
-             }
-             ```
-
-           - Add: pub async fn read_pane_output(&amp;self, session, pane_id, lines: Option&lt;usize&gt;) -> Result&lt;Vec&lt;String&gt;&gt;
-             Returns text content of the pane's current screen (one String per row).
-
-           - Add: pub async fn list_all_panes(&amp;self, session) -> Result&lt;Vec&lt;PaneSummary&gt;&gt;
-             Where PaneSummary has pane_id, workspace_id, cols, rows.
-
-        3. Create cmux-daemon/src/jsonrpc.rs:
+        1. Create cmux-client/examples/key_dump.rs — a minimal standalone program
+           that enables raw mode + alternate screen + mouse capture, reads events
+           from crossterm's blocking `event::read()` loop, and prints each event
+           to stderr (which we pipe to a file). Exits on Esc.
 
            ```rust
-           use cmux_ipc::protocol::{JsonRpcRequest, JsonRpcResponse};
-           use crate::session_manager::SessionManager;
-           use serde_json::{json, Value};
-           use std::sync::Arc;
+           use crossterm::event::{self, Event, KeyCode};
+           use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+           use std::io::Write;
 
-           /// Dispatch a JSON-RPC request to the appropriate handler.
-           pub async fn dispatch(
-               req: JsonRpcRequest,
-               session_manager: &amp;Arc&lt;SessionManager&gt;,
-               context: &amp;mut RpcContext,
-           ) -> JsonRpcResponse {
-               match req.method.as_str() {
-                   // Session methods
-                   "session.create" => session_create(req, session_manager).await,
-                   "session.list" => session_list(req, session_manager).await,
-                   "session.kill" => session_kill(req, session_manager).await,
+           fn main() -> anyhow::Result<()> {
+               enable_raw_mode()?;
+               crossterm::execute!(
+                   std::io::stdout(),
+                   crossterm::terminal::EnterAlternateScreen,
+                   crossterm::event::EnableMouseCapture,
+               )?;
 
-                   // Workspace methods
-                   "workspace.create" => workspace_create(req, session_manager, context).await,
-                   "workspace.list" => workspace_list(req, session_manager, context).await,
-                   "workspace.close" => workspace_close(req, session_manager, context).await,
-                   "workspace.switch" => workspace_switch(req, session_manager, context).await,
-
-                   // Surface (pane) methods
-                   "surface.list" => surface_list(req, session_manager, context).await,
-                   "surface.split" => surface_split(req, session_manager, context).await,
-                   "surface.send_text" => surface_send_text(req, session_manager, context).await,
-                   "surface.send_key" => surface_send_key(req, session_manager, context).await,
-                   "surface.read_output" => surface_read_output(req, session_manager, context).await,
-                   "surface.close" => surface_close(req, session_manager, context).await,
-
-                   // Notification methods
-                   "notify.send" => notify_send(req, session_manager).await,
-
-                   // Unknown method
-                   _ => JsonRpcResponse::error(req.id, -32601, format!("Method not found: {}", req.method)),
-               }
-           }
-
-           /// Per-connection context (tracks which session the RPC client is bound to).
-           pub struct RpcContext {
-               pub session: Option&lt;String&gt;,
-           }
-
-           impl RpcContext {
-               pub fn new() -&gt; Self {
-                   Self { session: None }
-               }
-           }
-           ```
-
-        4. Implement each handler. Example for session.create:
-           ```rust
-           async fn session_create(
-               req: JsonRpcRequest,
-               sm: &amp;Arc&lt;SessionManager&gt;,
-           ) -> JsonRpcResponse {
-               let name = match req.params.get("name").and_then(|v| v.as_str()) {
-                   Some(n) =&gt; n.to_string(),
-                   None =&gt; return JsonRpcResponse::error(req.id, -32602, "missing 'name' param"),
-               };
-               let shell = req.params.get("shell").and_then(|v| v.as_str()).map(String::from);
-               match sm.create_session(name, shell).await {
-                   Ok((id, name)) =&gt; JsonRpcResponse::success(
-                       req.id,
-                       json!({"session_id": id, "name": name}),
-                   ),
-                   Err(e) =&gt; JsonRpcResponse::error(req.id, -32000, e.to_string()),
-               }
-           }
-           ```
-
-           For session.create, also set context.session = Some(name) so subsequent
-           workspace/surface calls default to this session (or require a "session" param).
-
-           For surface.send_text: send raw bytes to pane:
-           ```rust
-           async fn surface_send_text(
-               req: JsonRpcRequest,
-               sm: &amp;Arc&lt;SessionManager&gt;,
-               ctx: &amp;RpcContext,
-           ) -&gt; JsonRpcResponse {
-               let session = match get_session(&amp;req, ctx) {
-                   Ok(s) =&gt; s,
-                   Err(e) =&gt; return JsonRpcResponse::error(req.id, -32602, e),
-               };
-               let pane_id = match req.params.get("pane_id").and_then(|v| v.as_u64()) {
-                   Some(id) =&gt; id as u32,
-                   None =&gt; return JsonRpcResponse::error(req.id, -32602, "missing 'pane_id'"),
-               };
-               let text = match req.params.get("text").and_then(|v| v.as_str()) {
-                   Some(t) =&gt; t,
-                   None =&gt; return JsonRpcResponse::error(req.id, -32602, "missing 'text'"),
-               };
-               match sm.send_input(&amp;session, pane_id, text.as_bytes()).await {
-                   Ok(()) =&gt; JsonRpcResponse::success(req.id, json!({"ok": true})),
-                   Err(e) =&gt; JsonRpcResponse::error(req.id, -32000, e.to_string()),
-               }
-           }
-           ```
-
-           For surface.send_key: translate key names ("Enter", "Tab", "C-c") to bytes
-           using cmux_config::parse::parse_key + key_to_bytes helper, or accept
-           literal bytes in a "bytes" array param.
-
-           For surface.read_output: get screen text content:
-           ```rust
-           // Returns: { "lines": ["row0", "row1", ...], "cursor_row": N, "cursor_col": M }
-           ```
-
-        5. Helper functions:
-           - get_session(req, ctx) -> Result&lt;String, String&gt;: check req.params["session"] or fall back to ctx.session
-           - parse_pane_id(req) -> Result&lt;u32, String&gt;
-
-        6. Unit tests (inline #[cfg(test)]):
-           - Unknown method returns -32601 error
-           - session.create without "name" param returns -32602 error
-           - session.create with valid params calls session_manager.create_session
-             (use a mock or just instantiate a real SessionManager since it's Arc-based)
-           - surface.send_text validates params
-      </action>
-
-      <verification>
-        <command>cargo build --workspace</command>
-        <command>cargo test -p cmux-daemon</command>
-        <command>cargo clippy --workspace</command>
-      </verification>
-
-      <done>
-        - jsonrpc.rs exists with dispatch function + all method handlers
-        - session.* / workspace.* / surface.* / notify.* methods implemented
-        - SessionManager has read_pane_output + list_all_panes + screen buffer per pane
-        - Unit tests verify dispatch routing and error handling
-        - All existing tests still pass
-      </done>
-    </task>
-
-    <task id="2" type="backend" complete="false">
-      <name>Dedicated RPC pipe listener with concurrent clients and event subscriptions</name>
-      <description>
-        Create a second Named Pipe listener (\\.\pipe\cmux-rpc) dedicated to
-        JSON-RPC clients. Each connection gets its own tokio task that reads
-        requests, dispatches them, writes responses. Supports event subscriptions
-        via JSON-RPC notifications for pane output streaming.
-      </description>
-
-      <files>
-        <create>
-          cmux-daemon/src/rpc_server.rs         (RPC pipe listener + per-client handler)
-        </create>
-        <modify>
-          cmux-daemon/src/main.rs                (spawn both server and rpc_server)
-        </modify>
-      </files>
-
-      <action>
-        1. Create cmux-daemon/src/rpc_server.rs:
-
-           ```rust
-           use crate::jsonrpc::{dispatch, RpcContext};
-           use crate::session_manager::SessionManager;
-           use cmux_ipc::protocol::{JsonRpcRequest, JsonRpcResponse};
-           use cmux_ipc::transport;
-           use std::sync::Arc;
-           use tokio::net::windows::named_pipe::{PipeMode, ServerOptions};
-           use tracing::{debug, error, info};
-
-           pub async fn run_rpc_server(
-               pipe_name: &amp;str,
-               session_manager: Arc&lt;SessionManager&gt;,
-           ) -&gt; anyhow::Result&lt;()&gt; {
-               info!(pipe = pipe_name, "Starting JSON-RPC server");
-
-               let mut server = ServerOptions::new()
-                   .first_pipe_instance(true)
-                   .pipe_mode(PipeMode::Byte)
-                   .create(pipe_name)?;
+               let mut stderr = std::io::stderr().lock();
+               writeln!(stderr, "key_dump: press keys, Esc to exit")?;
+               stderr.flush()?;
 
                loop {
-                   server.connect().await?;
-                   info!("RPC client connected");
-
-                   let sm = Arc::clone(&amp;session_manager);
-                   let (reader, writer) = tokio::io::split(server);
-
-                   tokio::spawn(async move {
-                       if let Err(e) = handle_rpc_client(reader, writer, sm).await {
-                           error!(error = %e, "RPC client handler error");
-                       }
-                       info!("RPC client disconnected");
-                   });
-
-                   server = ServerOptions::new()
-                       .pipe_mode(PipeMode::Byte)
-                       .create(pipe_name)?;
-               }
-           }
-
-           async fn handle_rpc_client&lt;R, W&gt;(
-               mut reader: R,
-               mut writer: W,
-               session_manager: Arc&lt;SessionManager&gt;,
-           ) -&gt; anyhow::Result&lt;()&gt;
-           where
-               R: tokio::io::AsyncRead + Unpin + Send + 'static,
-               W: tokio::io::AsyncWrite + Unpin + Send + 'static,
-           {
-               let mut context = RpcContext::new();
-
-               // Channel for writer task to serialize responses
-               let (resp_tx, mut resp_rx) = tokio::sync::mpsc::channel::&lt;JsonRpcResponse&gt;(256);
-
-               // Writer task
-               let writer_task = tokio::spawn(async move {
-                   while let Some(resp) = resp_rx.recv().await {
-                       if let Err(e) = transport::write_message(&amp;mut writer, &amp;resp).await {
-                           debug!(error = %e, "RPC write error");
-                           break;
-                       }
-                   }
-               });
-
-               // Reader loop
-               loop {
-                   let req: Option&lt;JsonRpcRequest&gt; =
-                       match transport::read_message(&amp;mut reader).await {
-                           Ok(r) =&gt; r,
-                           Err(e) =&gt; {
-                               debug!(error = %e, "RPC read error");
+                   match event::read()? {
+                       Event::Key(k) => {
+                           writeln!(stderr, "KEY {:?}", k)?;
+                           stderr.flush()?;
+                           if k.code == KeyCode::Esc {
                                break;
                            }
-                       };
-
-                   let req = match req {
-                       Some(r) =&gt; r,
-                       None =&gt; break,
-                   };
-
-                   // Dispatch (may be slow for some methods)
-                   let resp = dispatch(req, &amp;session_manager, &amp;mut context).await;
-                   if resp_tx.send(resp).await.is_err() {
-                       break;
+                       }
+                       Event::Mouse(m) => {
+                           writeln!(stderr, "MOUSE {:?}", m)?;
+                           stderr.flush()?;
+                       }
+                       Event::Resize(c, r) => {
+                           writeln!(stderr, "RESIZE {}x{}", c, r)?;
+                           stderr.flush()?;
+                       }
+                       other => {
+                           writeln!(stderr, "OTHER {:?}", other)?;
+                           stderr.flush()?;
+                       }
                    }
                }
 
-               drop(resp_tx);
-               let _ = writer_task.await;
+               disable_raw_mode()?;
+               crossterm::execute!(
+                   std::io::stdout(),
+                   crossterm::event::DisableMouseCapture,
+                   crossterm::terminal::LeaveAlternateScreen,
+               )?;
                Ok(())
            }
            ```
 
-        2. Event subscriptions (basic):
-           - When a client calls method "surface.subscribe", the handler:
-             * Subscribes to session_manager.subscribe_output()
-             * Spawns a task that forwards broadcast messages as JSON-RPC notifications
-             * Notification format: JsonRpcRequest with id=0 (per JSON-RPC 2.0 notification spec)
-             * Or use a different envelope — for simplicity, we'll use JsonRpcResponse without
-               a matching id (id = 0 = notification indicator in our protocol)
-           
-           Actually, to keep things simpler for Phase 8: skip the streaming subscription.
-           Agents can poll surface.read_output. Note this as deferred tech debt.
-           The plan says "SHOULD support event subscriptions" (REQ-API-005) — we'll
-           mark this as out of scope for Phase 8 MVP.
+           User runs: `cargo run -p cmux-client --example key_dump 2&gt; key_dump.log`
+           Then presses Ctrl+B, %, arrow keys, Esc.
+           The log shows exactly what crossterm sees.
 
-        3. Update cmux-daemon/src/main.rs to run both servers:
+        2. Based on the key_dump output, identify the actual bug. Likely candidates:
+           - crossterm feature flag missing (`bracketed-paste`, `event-stream`, `events`)
+           - Windows Terminal with `KeyboardEnhancementFlags` required
+           - EventStream (async) behaves differently from blocking event::read()
+           - Events are going via `KeyEventKind::Press` but the `kind` field is
+             `NoKind` on some Windows terminals (cargo/crossterm bug)
+           - The `key_event_to_bytes` fallthrough `_ => None` eating something
+
+        **PART B — Fix the identified bug**
+
+        3. Apply the fix. Possibilities:
+           - If EventStream doesn't deliver all events: switch to a blocking-thread-
+             with-mpsc pattern instead of crossterm's async EventStream
+           - If `kind` is `NoKind`: treat it the same as `Press`
+           - If enhancement flags are needed: call `PushKeyboardEnhancementFlags`
+             on enter, `PopKeyboardEnhancementFlags` on exit
+           - If case normalization wasn't enough: also normalize Shift+Char mappings
+
+        4. Remove the `debug_key_log` scaffolding and file path from terminal.rs.
+           (No debug file in production binary.)
+
+        **PART C — Alternate screen buffer**
+
+        5. In `RawModeGuard::enable()`, also enter the alternate screen buffer:
            ```rust
-           mod jsonrpc;
-           mod rpc_server;
-           mod server;
-           mod session_manager;
+           crossterm::execute!(
+               std::io::stdout(),
+               crossterm::terminal::EnterAlternateScreen,
+           )?;
+           ```
+           
+        6. In `RawModeGuard::drop()`, leave the alternate screen buffer (it's
+           already there per current code — verify it runs). This hides all the
+           host terminal's pre-cmux content while cmux is running and restores
+           it cleanly on exit.
 
-           use session_manager::SessionManager;
-           use std::sync::Arc;
-           use tracing::info;
+        **PART D — Reattach screen state**
 
-           #[tokio::main]
-           async fn main() -&gt; anyhow::Result&lt;()&gt; {
-               tracing_subscriber::fmt().with_env_filter(...).init();
-
-               let session_manager = Arc::new(SessionManager::new());
-               let pipe_name = cmux_config::defaults::PIPE_NAME;
-               let rpc_pipe_name = cmux_config::defaults::RPC_PIPE_NAME;
-
-               info!("cmux daemon starting");
-
-               // Run both servers concurrently
-               let sm1 = Arc::clone(&amp;session_manager);
-               let sm2 = Arc::clone(&amp;session_manager);
-               
-               let interactive = tokio::spawn(async move {
-                   server::run_server(pipe_name, sm1).await
-               });
-               let rpc = tokio::spawn(async move {
-                   rpc_server::run_rpc_server(rpc_pipe_name, sm2).await
-               });
-
-               // Exit if either fails
-               tokio::select! {
-                   r = interactive =&gt; { r??; }
-                   r = rpc =&gt; { r??; }
+        7. In `cmux-daemon/src/session_manager.rs`, add:
+           ```rust
+           /// Return the raw VT content that would reconstruct the current pane
+           /// screen state. Uses vt100's `contents_formatted()`.
+           pub async fn pane_snapshot_bytes(
+               &amp;self,
+               session_name: &amp;str,
+               pane_id: u32,
+           ) -&gt; Result&lt;Vec&lt;u8&gt;, CmuxError&gt; {
+               let sessions = self.sessions.lock().await;
+               let session = sessions.get(session_name)
+                   .ok_or_else(|| CmuxError::SessionNotFound(session_name.into()))?;
+               for ws in session.workspaces.values() {
+                   if let Some(pane) = ws.panes.get(&amp;pane_id) {
+                       let screen = pane.screen.lock().await;
+                       return Ok(screen.contents_formatted());
+                   }
                }
-
-               Ok(())
+               Err(CmuxError::PaneNotFound(cmux_core::types::PaneId(pane_id)))
            }
            ```
+           Also expose `contents_formatted()` on cmux-core::screen::ScreenBuffer if
+           it doesn't exist — vt100::Screen has a method by that name that returns
+           the screen state as a byte string with escape sequences.
 
-        4. Note in README / docs: JSON-RPC clients connect to \\.\pipe\cmux-rpc
-           (separate from interactive \\.\pipe\cmux).
+        8. In `cmux-daemon/src/server.rs`, after sending `SessionState` on Attach
+           and on CreateSession, iterate over all panes in the session and send
+           one `ServerMessage::PaneOutput { pane_id, data: snapshot_bytes }` per
+           pane. This makes the client's local screen buffer populate immediately.
+
+        9. Sanity check: the client's existing `process_output` path will feed
+           those bytes into its per-pane ScreenBuffer, and render_full will then
+           draw the restored state. No new client code needed.
       </action>
 
       <verification>
@@ -410,102 +197,261 @@
         <command>cargo clippy --workspace</command>
         <command>cargo test --workspace</command>
         <manual>
-          1. Start daemon: cargo run -p cmux-daemon
-          2. Verify log shows both "Starting server" and "Starting JSON-RPC server"
-          3. Connect to \\.\pipe\cmux-rpc manually (e.g. PowerShell named pipe client)
-          4. Send JSON-RPC session.create request
-          5. Verify response matches format
+          1. Run: cargo run -p cmux-client --example key_dump 2&gt; key_dump.log
+             Press Ctrl+B, %, arrow keys, Esc. Inspect key_dump.log to verify
+             crossterm is actually delivering events.
+          2. Start daemon, start interactive client with `new -s main`.
+          3. Verify alternate screen buffer is entered (host terminal content
+             disappears, cmux takes over the whole window).
+          4. Press Ctrl+B, release, Shift+5 → pane should split vertically.
+          5. Type in each pane → only active pane receives input.
+          6. Ctrl+B d → detaches, host terminal restored.
+          7. cargo run -p cmux-client -- attach -t main → reattach shows
+             the actual pane content restored (not blank).
         </manual>
       </verification>
 
       <done>
-        - Daemon runs both interactive server and RPC server concurrently
-        - JSON-RPC clients connect to \\.\pipe\cmux-rpc independently of interactive clients
-        - Multiple concurrent RPC clients can connect without blocking each other
-        - Each client has its own RpcContext for session binding
-        - Clean error handling on disconnect
+        - key_dump.log shows clear evidence of what's happening on Windows
+        - Ctrl+B prefix detection works end-to-end
+        - Alternate screen buffer is used (host terminal preserved)
+        - Reattach restores visible pane content from daemon's ScreenBuffer
+        - debug_key_log scaffolding removed
+        - All existing tests still pass
       </done>
     </task>
 
-    <task id="3" type="test" complete="false">
-      <name>JSON-RPC integration tests — round-trip methods over Named Pipe</name>
+    <task id="2" type="backend" complete="false">
+      <name>CLI command completeness, daemon graceful shutdown, and file logging</name>
       <description>
-        Write integration tests that spin up the RPC server, connect a client,
-        and exercise the full JSON-RPC API: create session, split pane, send text,
-        read output, list panes, kill session.
+        Round out the CLI with the commands listed in REQUIREMENTS.md Section 9.1
+        that aren't yet present. Add graceful shutdown handling to the daemon so
+        Ctrl+C cleanly kills all PTYs. Route daemon logs to %APPDATA%\cmux\cmux.log
+        via tracing-appender.
+      </description>
+
+      <files>
+        <modify>
+          cmux-client/src/main.rs               (add detach, list-panes, list-windows, rename-session, rename-window, send-keys, display-message, kill-server subcommands)
+          cmux-daemon/src/main.rs                (graceful shutdown via tokio::signal::ctrl_c(), file logging via tracing-appender)
+          cmux-daemon/src/session_manager.rs     (add shutdown_all() that kills every pane across all sessions cleanly)
+          cmux-daemon/Cargo.toml                (verify tracing-appender is already a dep — it was added in Phase 1)
+        </modify>
+      </files>
+
+      <action>
+        1. **CLI additions** in cmux-client/src/main.rs (via clap subcommands):
+           - `detach` — send Detach message from CLI context (rarely needed, usually done via keybinding, but per spec)
+           - `list-panes -t &lt;session&gt;` — call GetSessionState, pretty-print all pane IDs + workspace mapping
+           - `list-windows -t &lt;session&gt;` — same but workspaces only
+           - `rename-session -t &lt;old&gt; -n &lt;new&gt;` — for now, log "not implemented" and exit 1 (real rename needs daemon support, deferred)
+           - `send-keys -t &lt;session&gt; -p &lt;pane&gt; &lt;keys...&gt;` — create a one-shot connection, send PaneInput, disconnect
+           - `kill-server` — tells daemon to shut down (new ClientMessage::KillServer + daemon-side handler that triggers tokio::process::exit)
+           - `display-message &lt;msg&gt;` — deferred, log "not implemented"
+
+           The subcommands that work end-to-end: `list-panes`, `list-windows`, `send-keys`, `kill-server`.
+           The rest print a polite "not yet implemented" so the CLI is complete even if some commands are stubs.
+
+        2. **Graceful shutdown** in cmux-daemon/src/main.rs:
+           ```rust
+           let shutdown_sm = Arc::clone(&amp;session_manager);
+           tokio::select! {
+               r = interactive =&gt; { r??; }
+               r = rpc =&gt; { r??; }
+               _ = tokio::signal::ctrl_c() =&gt; {
+                   info!("Received Ctrl+C, shutting down");
+                   shutdown_sm.shutdown_all().await;
+               }
+           }
+           ```
+           Add `shutdown_all()` to SessionManager that iterates all sessions and
+           kills every ConPty before returning.
+
+        3. **File logging** in cmux-daemon/src/main.rs:
+           Use tracing-appender's rolling file to %APPDATA%\cmux\cmux.log:
+           ```rust
+           let log_dir = dirs::data_dir()
+               .map(|d| d.join("cmux"))
+               .unwrap_or_else(|| std::env::temp_dir().join("cmux"));
+           std::fs::create_dir_all(&amp;log_dir).ok();
+           let file_appender = tracing_appender::rolling::daily(&amp;log_dir, "cmux.log");
+           let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+
+           tracing_subscriber::fmt()
+               .with_writer(non_blocking)
+               .with_env_filter(...)
+               .init();
+           ```
+           Keep the `_guard` alive in main's scope (drop flushes).
+
+           Note: add `dirs = "5"` to cmux-daemon's dependencies if not already there.
+
+        4. **Error handling improvements** in cmux-daemon/src/server.rs and
+           cmux-daemon/src/session_manager.rs:
+           - When a ConPty's reader task detects EOF (child exited), broadcast a
+             PaneOutput with a final "[process exited with code N]\r\n" line so
+             attached clients see it.
+             Requires ConPty::try_wait() to get exit code. Already exists.
+           - When a client pipe read fails, log the error and continue serving
+             (current behavior is to break the loop — that's correct).
+      </action>
+
+      <verification>
+        <command>cargo build --workspace</command>
+        <command>cargo clippy --workspace</command>
+        <command>cargo test --workspace</command>
+        <manual>
+          1. Start daemon, check %APPDATA%\cmux\cmux.log.YYYY-MM-DD is being written.
+          2. cargo run -p cmux-client -- new -s main → press Ctrl+B % to split
+          3. cargo run -p cmux-client -- list-panes -t main → shows 2 panes
+          4. cargo run -p cmux-client -- send-keys -t main -p 0 "echo test"
+          5. In daemon terminal: press Ctrl+C → daemon logs "shutting down",
+             kills all PTYs, exits cleanly (no orphaned powershell.exe processes
+             in Task Manager)
+        </manual>
+      </verification>
+
+      <done>
+        - CLI has all commands from REQUIREMENTS.md Section 9.1 (real or stubbed)
+        - Daemon logs to %APPDATA%\cmux\cmux.log with daily rotation
+        - Ctrl+C on daemon triggers graceful shutdown — no orphaned PTYs
+        - Child process exit codes displayed in panes
+        - All tests still pass
+      </done>
+    </task>
+
+    <task id="3" type="deploy" complete="false">
+      <name>README, GitHub Actions CI, and release artifacts</name>
+      <description>
+        Write the user-facing README with installation, quickstart, keybindings,
+        and JSON-RPC API reference. Set up GitHub Actions CI on windows-latest
+        running build/test/clippy/fmt. Add a release workflow that produces
+        standalone .exe artifacts.
       </description>
 
       <files>
         <create>
-          cmux-daemon/tests/rpc_integration.rs  (full JSON-RPC round-trip tests)
+          README.md                              (top-level user-facing docs)
+          .github/workflows/ci.yml              (build, test, clippy, fmt on windows-latest)
+          .github/workflows/release.yml         (release build + upload .exe artifacts on tag push)
         </create>
+        <modify>
+          Cargo.toml                             (add workspace.package metadata: authors, license, repository, description)
+        </modify>
       </files>
 
       <action>
-        1. Create cmux-daemon/tests/rpc_integration.rs with a helper that starts
-           the RPC server on a unique pipe name for each test:
+        1. **README.md** with the following sections:
+           - What is cmux (one paragraph)
+           - Status badge row (CI status, crate version — placeholder for now)
+           - Installation (build from source: `cargo build --release`)
+           - Quickstart: start daemon + client in two terminals, basic prefix
+             keys (the tmux-style two-step)
+           - Keybinding reference table
+           - Configuration example (link to cmux-config/example/cmux.toml)
+           - JSON-RPC API overview with a Python + PowerShell example
+             (reference scripts/cmux-rpc.ps1)
+           - Architecture diagram (ASCII art showing daemon/client/RPC pipe)
+           - Known limitations (list tech debt: scrollback search stubbed, 
+             no MSI installer yet, copy-mode scrollback nav, daemon session
+             persistence across restarts)
+           - Building + testing (cargo build/test/clippy commands)
+           - Contributing (link to REQUIREMENTS.md and .planning/ROADMAP.md)
+           - License (MIT or Apache-2.0 — match what's in Cargo.toml)
 
-           ```rust
-           use cmux_ipc::protocol::{JsonRpcRequest, JsonRpcResponse};
-           use cmux_ipc::transport;
-           use serde_json::json;
-           use tokio::net::windows::named_pipe::{ClientOptions, PipeMode, ServerOptions};
-           use tokio::time::{timeout, Duration};
+        2. **.github/workflows/ci.yml**:
+           ```yaml
+           name: CI
+           on:
+             push:
+               branches: [main]
+             pull_request:
+               branches: [main]
 
-           fn test_pipe_name(suffix: &amp;str) -&gt; String {
-               format!(r"\\.\pipe\cmux_rpc_test_{}", suffix)
-           }
-
-           async fn start_test_server(pipe_name: String) -&gt; tokio::task::JoinHandle&lt;()&gt; {
-               // Create SessionManager, spawn run_rpc_server in background
-           }
+           jobs:
+             build:
+               runs-on: windows-latest
+               steps:
+                 - uses: actions/checkout@v4
+                 - uses: dtolnay/rust-toolchain@stable
+                   with:
+                     components: rustfmt, clippy
+                 - uses: Swatinem/rust-cache@v2
+                 - name: Check formatting
+                   run: cargo fmt --all --check
+                 - name: Clippy
+                   run: cargo clippy --workspace -- -D warnings
+                 - name: Build
+                   run: cargo build --workspace
+                 - name: Test
+                   run: cargo test --workspace
            ```
 
-        2. Test cases:
-           - test_session_create_via_rpc: Connect, send session.create, verify response
-             has session_id and name.
-           - test_method_not_found: Send unknown method, verify -32601 error.
-           - test_missing_params: Send session.create without name, verify -32602 error.
-           - test_session_list: Create 2 sessions, call session.list, verify both returned.
-           - test_surface_send_text: Create session, send "echo hi" via surface.send_text,
-             call surface.read_output, verify "hi" appears in output.
-           - test_kill_session: Create + kill, verify success.
+        3. **.github/workflows/release.yml**:
+           ```yaml
+           name: Release
+           on:
+             push:
+               tags: ['v*']
 
-        Note: These tests require the daemon internals (SessionManager + rpc_server)
-        to be accessible as a library. Since cmux-daemon is a bin crate currently,
-        we may need to add a [lib] target or make the modules pub within the bin.
-        
-        Simplest approach: add `pub mod rpc_server; pub mod jsonrpc; pub mod session_manager;`
-        declarations. Integration tests in cmux-daemon/tests/ can access the bin's
-        modules via the `use cmux_daemon::*` path IF cmux-daemon has a lib target.
-        
-        Alternative: add a minimal [lib] section to cmux-daemon/Cargo.toml:
-        ```toml
-        [lib]
-        name = "cmux_daemon"
-        path = "src/lib.rs"
-        ```
-        And create src/lib.rs that re-exports the modules:
-        ```rust
-        pub mod jsonrpc;
-        pub mod rpc_server;
-        pub mod session_manager;
-        ```
-        Then src/main.rs uses `use cmux_daemon::{...}`.
+           jobs:
+             release:
+               runs-on: windows-latest
+               steps:
+                 - uses: actions/checkout@v4
+                 - uses: dtolnay/rust-toolchain@stable
+                 - uses: Swatinem/rust-cache@v2
+                 - name: Build release
+                   run: cargo build --release --workspace
+                 - name: Package
+                   shell: pwsh
+                   run: |
+                     New-Item -ItemType Directory -Path release | Out-Null
+                     Copy-Item target/release/cmux-daemon.exe release/
+                     Copy-Item target/release/cmux-client.exe release/
+                     Copy-Item README.md release/
+                     Copy-Item cmux-config/example/cmux.toml release/cmux.example.toml
+                     Compress-Archive -Path release/* -DestinationPath cmux-$env:GITHUB_REF_NAME-windows-x64.zip
+                 - name: Upload release
+                   uses: softprops/action-gh-release@v2
+                   with:
+                     files: cmux-*.zip
+           ```
 
-        Go with the lib-target approach.
+        4. **Workspace metadata** in root Cargo.toml:
+           ```toml
+           [workspace.package]
+           version = "0.1.0"
+           edition = "2021"
+           license = "MIT OR Apache-2.0"
+           repository = "https://github.com/USER/cmux"
+           description = "Native Windows terminal multiplexer"
+           ```
+           And each crate's Cargo.toml picks these up with `*.workspace = true`.
+           (Optional — only if the user wants to publish to crates.io eventually.)
+
+        5. Verify `cargo build --release` produces two exes in `target/release/`
+           that can run standalone (no cargo needed).
       </action>
 
       <verification>
-        <command>cargo test -p cmux-daemon --test rpc_integration</command>
+        <command>cargo build --release --workspace</command>
         <command>cargo test --workspace</command>
+        <manual>
+          1. README renders correctly on GitHub preview
+          2. target/release/cmux-daemon.exe runs standalone
+          3. target/release/cmux-client.exe runs standalone
+          4. Push a test tag: git tag v0.0.1-test &amp;&amp; git push --tags
+             — verify release workflow triggers in GitHub Actions (if repo pushed)
+        </manual>
       </verification>
 
       <done>
-        - 6+ integration tests exercising the JSON-RPC API end-to-end over Named Pipes
-        - Tests cover: session lifecycle, error cases, surface send/read
-        - All existing tests still pass
-        - Total test count grows by at least 6
+        - README.md exists and accurately describes the project
+        - CI workflow passes on windows-latest
+        - Release workflow builds standalone .exe artifacts
+        - Workspace Cargo.toml has shared metadata
+        - `cargo build --release` produces working standalone binaries
       </done>
     </task>
   </tasks>
@@ -513,25 +459,45 @@
   <phase_verification>
     <commands>
       <command>cargo build --workspace</command>
-      <command>cargo clippy --workspace</command>
+      <command>cargo build --release --workspace</command>
+      <command>cargo clippy --workspace -- -D warnings</command>
       <command>cargo fmt --all --check</command>
       <command>cargo test --workspace</command>
     </commands>
     <manual>
-      1. Start daemon, verify both servers log startup
-      2. Write a quick Python/PowerShell client to connect to \\.\pipe\cmux-rpc
-      3. Send session.create + surface.send_text + surface.read_output
-      4. Verify round-trip works
+      1. Fresh install: cargo clean, cargo build --release
+      2. Start daemon: .\target\release\cmux-daemon.exe
+      3. Start client: .\target\release\cmux-client.exe new -s main
+      4. Interactive client actually works: Ctrl+B %, arrow navigate, Ctrl+B d
+      5. JSON-RPC path still works via scripts/cmux-rpc.ps1
+      6. Daemon Ctrl+C is clean (no orphaned powershell.exe)
+      7. Check %APPDATA%\cmux\cmux.log.YYYY-MM-DD has logs
+      8. README is accurate and matches what actually works
     </manual>
   </phase_verification>
 
   <completion_criteria>
     <criterion>All 3 tasks marked complete</criterion>
     <criterion>cargo build/clippy/fmt/test all pass</criterion>
-    <criterion>JSON-RPC server runs on \\.\pipe\cmux-rpc alongside interactive server</criterion>
-    <criterion>All core methods work: session/workspace/surface/notify</criterion>
-    <criterion>surface.read_output returns actual screen text content</criterion>
-    <criterion>Integration tests verify round-trip over Named Pipe</criterion>
-    <criterion>Concurrent RPC clients supported</criterion>
+    <criterion>Interactive client works end-to-end (Ctrl+B prefix, split, navigate, detach/reattach)</criterion>
+    <criterion>JSON-RPC path still works (Phase 8 regression check)</criterion>
+    <criterion>Release build produces standalone .exe</criterion>
+    <criterion>README covers installation, quickstart, keybindings, and JSON-RPC API</criterion>
+    <criterion>CI workflow runs on windows-latest</criterion>
+    <criterion>Daemon graceful shutdown on Ctrl+C</criterion>
+    <criterion>No debug_key_log scaffolding left in production code</criterion>
   </completion_criteria>
+
+  <deferred>
+    Explicitly NOT in Phase 9 scope (post-v1.0):
+    - MSI installer / WinGet / Scoop / Chocolatey packages
+    - Session state persistence across daemon restarts
+    - OSC 9/99/777 toast notifications
+    - Interactive command mode (prefix + :)
+    - rename-session / rename-window real implementations
+    - Scrollback search in copy mode
+    - Scrollback history navigation in copy mode (vt100::Screen scroll_up)
+    - JSON-RPC event streaming subscriptions
+    - Cross-platform Linux/macOS support
+  </deferred>
 </plan>

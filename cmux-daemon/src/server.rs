@@ -169,11 +169,32 @@ where
                     Ok((session_name, workspaces, active_workspace)) => {
                         let _ = resp_tx
                             .send(ServerMessage::SessionState {
-                                session_name,
-                                workspaces,
+                                session_name: session_name.clone(),
+                                workspaces: workspaces.clone(),
                                 active_workspace,
                             })
                             .await;
+
+                        // Replay current pane content so the client's local
+                        // ScreenBuffer can be populated without waiting for
+                        // new output from the shell.
+                        for ws in &workspaces {
+                            for pane_id in &ws.pane_ids {
+                                if let Ok(snapshot) = session_manager
+                                    .pane_snapshot_bytes(&session, *pane_id)
+                                    .await
+                                {
+                                    if !snapshot.is_empty() {
+                                        let _ = resp_tx
+                                            .send(ServerMessage::PaneOutput {
+                                                pane_id: *pane_id,
+                                                data: snapshot,
+                                            })
+                                            .await;
+                                    }
+                                }
+                            }
+                        }
                     }
                     Err(e) => {
                         let _ = resp_tx

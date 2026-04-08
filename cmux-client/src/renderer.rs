@@ -206,11 +206,6 @@ pub struct Renderer {
 }
 
 impl Renderer {
-    #[allow(dead_code)]
-    pub fn new() -> Self {
-        Self::with_theme(Theme::default())
-    }
-
     pub fn with_theme(theme: Theme) -> Self {
         Self {
             prev_snapshots: HashMap::new(),

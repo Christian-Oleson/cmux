@@ -13,7 +13,9 @@
       "Bash(git merge:*)",
       "Bash(git stash:*)",
       "Bash(git commit:*)",
-      "Bash(git branch:*)"
+      "Bash(git branch:*)",
+      "Bash(tasklist)",
+      "Bash(ls:*)"
     ]
   }
 }

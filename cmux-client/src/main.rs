@@ -38,6 +38,40 @@ enum Commands {
         #[arg(short = 't', long)]
         target: String,
     },
+    /// List all panes across workspaces in a session
+    ListPanes {
+        /// Target session name
+        #[arg(short = 't', long)]
+        target: String,
+    },
+    /// List workspaces in a session
+    ListWindows {
+        /// Target session name
+        #[arg(short = 't', long)]
+        target: String,
+    },
+    /// Send text/keys to a specific pane without attaching
+    SendKeys {
+        /// Target session name
+        #[arg(short = 't', long)]
+        target: String,
+        /// Target pane id
+        #[arg(short = 'p', long)]
+        pane: u32,
+        /// Text to send (use `\r` for Enter)
+        text: String,
+    },
+    /// Rename a session (not yet implemented)
+    RenameSession {
+        #[arg(short = 't', long)]
+        target: String,
+        #[arg(short = 'n', long)]
+        new_name: String,
+    },
+    /// Display a message in the active client (not yet implemented)
+    DisplayMessage { message: String },
+    /// Detach the current client (rarely used — usually done via keybinding)
+    Detach,
 }
 
 #[tokio::main]
@@ -112,24 +146,9 @@ async fn main() -> anyhow::Result<()> {
             })
             .await?;
 
-            // Wait for Ok or Error confirming the attach
-            match conn.recv().await? {
-                Some(ServerMessage::Ok) => {
-                    info!("Attached to session");
-                }
-                Some(ServerMessage::Error { message }) => {
-                    eprintln!("cmux: {message}");
-                    std::process::exit(1);
-                }
-                _ => {
-                    eprintln!("cmux: unexpected response from daemon");
-                    std::process::exit(1);
-                }
-            }
-
-            // Enter interactive terminal mode.
-            // The daemon will send a SessionState message to rebuild workspace
-            // state within the terminal loop.
+            // Don't consume any response here — the daemon will send a
+            // SessionState message (or Error) that the terminal loop handles.
+            // Consuming it early would bypass rebuild_from_state().
             let (reader, writer) = conn.split();
             terminal::run_terminal(reader, writer, &target, &config).await?;
 
@@ -187,14 +206,160 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
+        Some(Commands::ListPanes { target }) => {
+            let mut conn = match DaemonConnection::connect(pipe_name).await {
+                Ok(c) => c,
+                Err(_) => {
+                    eprintln!("cmux: daemon not running. Start with: cmux-daemon");
+                    std::process::exit(1);
+                }
+            };
+
+            // Attach briefly so the daemon has context for GetSessionState.
+            conn.send(&ClientMessage::Attach {
+                session: target.clone(),
+            })
+            .await?;
+            // Drain SessionState or error
+            match conn.recv().await? {
+                Some(ServerMessage::SessionState {
+                    session_name,
+                    workspaces,
+                    active_workspace,
+                }) => {
+                    println!("Session: {session_name}");
+                    for ws in &workspaces {
+                        let marker = if ws.id == active_workspace { "*" } else { " " };
+                        println!("  {} workspace {} ({}):", marker, ws.id, ws.name);
+                        for pid in &ws.pane_ids {
+                            println!("      pane {}", pid);
+                        }
+                    }
+                }
+                Some(ServerMessage::Error { message }) => {
+                    eprintln!("cmux: {message}");
+                    std::process::exit(1);
+                }
+                other => {
+                    eprintln!("cmux: unexpected response from daemon: {:?}", other);
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        Some(Commands::ListWindows { target }) => {
+            let mut conn = match DaemonConnection::connect(pipe_name).await {
+                Ok(c) => c,
+                Err(_) => {
+                    eprintln!("cmux: daemon not running. Start with: cmux-daemon");
+                    std::process::exit(1);
+                }
+            };
+
+            conn.send(&ClientMessage::Attach {
+                session: target.clone(),
+            })
+            .await?;
+            match conn.recv().await? {
+                Some(ServerMessage::SessionState {
+                    workspaces,
+                    active_workspace,
+                    ..
+                }) => {
+                    for ws in &workspaces {
+                        let marker = if ws.id == active_workspace { "*" } else { " " };
+                        println!(
+                            "{} {}: {} ({} panes)",
+                            marker,
+                            ws.id,
+                            ws.name,
+                            ws.pane_ids.len()
+                        );
+                    }
+                }
+                Some(ServerMessage::Error { message }) => {
+                    eprintln!("cmux: {message}");
+                    std::process::exit(1);
+                }
+                other => {
+                    eprintln!("cmux: unexpected response from daemon: {:?}", other);
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        Some(Commands::SendKeys { target, pane, text }) => {
+            let mut conn = match DaemonConnection::connect(pipe_name).await {
+                Ok(c) => c,
+                Err(_) => {
+                    eprintln!("cmux: daemon not running. Start with: cmux-daemon");
+                    std::process::exit(1);
+                }
+            };
+
+            conn.send(&ClientMessage::Attach {
+                session: target.clone(),
+            })
+            .await?;
+            // Drain the SessionState response from attach
+            match conn.recv().await? {
+                Some(ServerMessage::SessionState { .. }) => {}
+                Some(ServerMessage::Error { message }) => {
+                    eprintln!("cmux: {message}");
+                    std::process::exit(1);
+                }
+                _ => {}
+            }
+
+            // Interpret literal \r / \n / \t escapes in the text argument
+            let bytes = text
+                .replace("\\r", "\r")
+                .replace("\\n", "\n")
+                .replace("\\t", "\t")
+                .into_bytes();
+
+            conn.send(&ClientMessage::PaneInput {
+                pane_id: pane,
+                data: bytes,
+            })
+            .await?;
+
+            // Let the daemon process the input
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        Some(Commands::RenameSession { target, new_name }) => {
+            eprintln!(
+                "cmux: rename-session is not yet implemented (target={}, new={})",
+                target, new_name
+            );
+            std::process::exit(1);
+        }
+
+        Some(Commands::DisplayMessage { message }) => {
+            eprintln!("cmux: display-message is not yet implemented: {}", message);
+            std::process::exit(1);
+        }
+
+        Some(Commands::Detach) => {
+            eprintln!(
+                "cmux: 'detach' as a one-shot CLI command is a no-op. \
+                 To detach from an interactive session, press Ctrl+B then d."
+            );
+        }
+
         None => {
             println!("cmux - Windows terminal multiplexer");
             println!();
             println!("Usage:");
-            println!("  cmux new -s <name>          Create a new session");
-            println!("  cmux attach -t <name>       Attach to a session");
-            println!("  cmux ls                     List sessions");
-            println!("  cmux kill-session -t <name> Kill a session");
+            println!("  cmux new -s <name>              Create a new session");
+            println!("  cmux attach -t <name>           Attach to a session");
+            println!("  cmux ls                         List sessions");
+            println!("  cmux kill-session -t <name>     Kill a session");
+            println!("  cmux list-panes -t <name>       List all panes in a session");
+            println!("  cmux list-windows -t <name>     List workspaces in a session");
+            println!("  cmux send-keys -t <name> -p <pane> <text>");
+            println!("                                   Send text to a pane");
         }
     }
 

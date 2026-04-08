@@ -18,6 +18,7 @@ pub struct PaneManager {
 }
 
 impl PaneManager {
+    #[cfg(test)]
     pub fn new(rows: u16, cols: u16) -> Self {
         Self::new_with_session("0".into(), rows, cols)
     }

@@ -37,6 +37,7 @@ struct RawModeGuard;
 impl RawModeGuard {
     fn enable() -> anyhow::Result<Self> {
         enable_raw_mode()?;
+        crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen,)?;
         Ok(Self)
     }
 }
@@ -104,6 +105,18 @@ where
             event = event_stream.next() => {
                 match event {
                     Some(Ok(Event::Key(key_event))) => {
+                        // Filter out only Release events. Accept Press, Repeat,
+                        // and any other kind (including NoKind that some
+                        // Windows consoles deliver). On Windows, crossterm may
+                        // emit both Press and Release for a single keystroke;
+                        // processing the Release would double-fire the prefix
+                        // state machine.
+                        if matches!(
+                            key_event.kind,
+                            crossterm::event::KeyEventKind::Release
+                        ) {
+                            continue;
+                        }
                         match &mut input_mode {
                             InputMode::Normal => {
                                 // Check for prefix key
@@ -824,8 +837,19 @@ fn clipboard_get() -> Result<String, String> {
 
 /// Convert a crossterm [`KeyEvent`] into a crossterm-independent [`InputKey`].
 fn to_input_key(event: &KeyEvent) -> InputKey {
+    let ctrl = event.modifiers.contains(KeyModifiers::CONTROL);
     let code = match event.code {
-        KeyCode::Char(c) => CmuxKeyCode::Char(c),
+        KeyCode::Char(c) => {
+            // Normalize Ctrl+letter to lowercase. On Windows, crossterm may
+            // report the character as uppercase for Ctrl-combos depending on
+            // keyboard state, which would break exact-match keybinding lookup.
+            let normalized = if ctrl && c.is_ascii_alphabetic() {
+                c.to_ascii_lowercase()
+            } else {
+                c
+            };
+            CmuxKeyCode::Char(normalized)
+        }
         KeyCode::Enter => CmuxKeyCode::Enter,
         KeyCode::Backspace => CmuxKeyCode::Backspace,
         KeyCode::Tab => CmuxKeyCode::Tab,
@@ -846,7 +870,7 @@ fn to_input_key(event: &KeyEvent) -> InputKey {
     };
     InputKey {
         code,
-        ctrl: event.modifiers.contains(KeyModifiers::CONTROL),
+        ctrl,
         alt: event.modifiers.contains(KeyModifiers::ALT),
         shift: event.modifiers.contains(KeyModifiers::SHIFT),
     }
