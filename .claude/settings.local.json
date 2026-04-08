@@ -16,7 +16,8 @@
       "Bash(git branch:*)",
       "Bash(tasklist)",
       "Bash(ls:*)",
-      "Bash(taskkill:*)"
+      "Bash(taskkill:*)",
+      "Bash(git rm:*)"
     ]
   }
 }

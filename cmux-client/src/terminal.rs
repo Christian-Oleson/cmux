@@ -56,7 +56,7 @@ impl Drop for RawModeGuard {
 }
 
 pub async fn run_terminal<R, W>(
-    mut pipe_reader: R,
+    pipe_reader: R,
     mut pipe_writer: W,
     session_name: &str,
     config: &Config,
@@ -83,6 +83,31 @@ where
     let mut event_stream = EventStream::new();
     let key_table = config.build_key_table();
     let copy_mode_table = CopyModeKeyTable::default_vi();
+
+    // Spawn a dedicated reader task. `transport::read_message` is NOT
+    // cancellation-safe: if `tokio::select!` drops a partial read mid-stream
+    // (e.g., after the 4-byte length prefix but before the body), the pipe
+    // desyncs and the next read interprets body bytes as a new length.
+    // Running the reader in its own task and shipping parsed messages over
+    // an mpsc channel sidesteps the issue because `recv()` IS cancel-safe.
+    let (server_tx, mut server_rx) = tokio::sync::mpsc::channel::<ServerMessage>(256);
+    let reader_handle = tokio::spawn(async move {
+        let mut reader = pipe_reader;
+        loop {
+            match transport::read_message::<_, ServerMessage>(&mut reader).await {
+                Ok(Some(msg)) => {
+                    if server_tx.send(msg).await.is_err() {
+                        break;
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    debug!(error = %e, "pipe reader task error");
+                    break;
+                }
+            }
+        }
+    });
 
     // Initial full render with status bar
     {
@@ -337,7 +362,11 @@ where
                 }
             }
 
-            msg = transport::read_message::<_, ServerMessage>(&mut pipe_reader) => {
+            msg = server_rx.recv() => {
+                // Normalize into the same Result<Option<T>> shape the old
+                // path used so the rest of this block is unchanged.
+                let msg: Result<Option<ServerMessage>, std::io::Error> =
+                    Ok(msg);
                 match msg {
                     Ok(Some(ServerMessage::PaneOutput { pane_id, data })) => {
                         panes.process_output(PaneId(pane_id), &data);
@@ -486,6 +515,9 @@ where
         }
     }
 
+    // Reader task is joined on the way out. It will exit naturally when
+    // the pipe closes (client drops writer + daemon drops its end).
+    let _ = reader_handle.await;
     Ok(())
 }
 
