@@ -868,11 +868,22 @@ fn to_input_key(event: &KeyEvent) -> InputKey {
         // Unmapped keys get a null char placeholder
         _ => CmuxKeyCode::Char('\0'),
     };
+    // For Char events the character value already encodes whatever shift
+    // state produced it (Shift+5 => '%', Shift+a => 'A'), so the SHIFT
+    // modifier is semantically redundant and would break exact-match binding
+    // lookup against the default key table (which binds '%' without SHIFT).
+    // Strip it for Char events. Non-Char events (Tab, arrows, etc.) keep
+    // SHIFT so bindings like Shift+Tab still work.
+    let shift = if matches!(code, CmuxKeyCode::Char(_)) {
+        false
+    } else {
+        event.modifiers.contains(KeyModifiers::SHIFT)
+    };
     InputKey {
         code,
         ctrl,
         alt: event.modifiers.contains(KeyModifiers::ALT),
-        shift: event.modifiers.contains(KeyModifiers::SHIFT),
+        shift,
     }
 }
 

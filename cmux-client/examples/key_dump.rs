@@ -1,64 +1,73 @@
 //! Minimal standalone key event dumper for diagnosing cmux input issues.
 //!
 //! Usage:
-//!   cargo run -p cmux-client --example key_dump 2> key_dump.log
+//!   cargo run -p cmux-client --example key_dump
 //!
-//! Then press keys (including Ctrl+B, %, arrow keys). Press Esc to exit.
-//! Inspect key_dump.log to see exactly what events crossterm delivers.
+//! Writes every crossterm event to stdout live AND to key_dump.log in the
+//! current directory. Press Esc to exit.
 //!
 //! Uses blocking `event::read()` (not async EventStream) to isolate whether
 //! the async path is the source of any input bugs.
 
 use crossterm::event::{self, Event, KeyCode};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use std::fs::OpenOptions;
 use std::io::Write;
 
 fn main() -> anyhow::Result<()> {
-    enable_raw_mode()?;
-    crossterm::execute!(
-        std::io::stdout(),
-        crossterm::terminal::EnterAlternateScreen,
-        crossterm::event::EnableMouseCapture,
-    )?;
+    // Open log file up front
+    let mut log = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open("key_dump.log")?;
 
-    let mut stderr = std::io::stderr().lock();
-    writeln!(stderr, "key_dump: press keys, Esc to exit")?;
-    stderr.flush()?;
+    writeln!(log, "key_dump started")?;
+    log.flush()?;
+
+    println!("========================================");
+    println!(" cmux key_dump diagnostic");
+    println!("========================================");
+    println!();
+    println!("Press keys to see what crossterm delivers.");
+    println!("All events are written to key_dump.log");
+    println!("Press Esc to exit.");
+    println!();
+
+    // Enable raw mode so we receive keys (no alt screen so host terminal
+    // keeps showing what we print).
+    enable_raw_mode()?;
 
     let result = (|| -> anyhow::Result<()> {
         loop {
-            match event::read()? {
-                Event::Key(k) => {
-                    writeln!(stderr, "KEY {:?}", k)?;
-                    stderr.flush()?;
-                    if k.code == KeyCode::Esc {
-                        break;
-                    }
-                }
-                Event::Mouse(m) => {
-                    writeln!(stderr, "MOUSE {:?}", m)?;
-                    stderr.flush()?;
-                }
-                Event::Resize(c, r) => {
-                    writeln!(stderr, "RESIZE {}x{}", c, r)?;
-                    stderr.flush()?;
-                }
-                other => {
-                    writeln!(stderr, "OTHER {:?}", other)?;
-                    stderr.flush()?;
+            let ev = event::read()?;
+            // Print to the host terminal so it is visible live, plus log it
+            // to the file for copy-paste.
+            let line = format!("{:?}", ev);
+            // `\r\n` needed in raw mode so the cursor returns to col 0
+            print!("{}\r\n", line);
+            std::io::stdout().flush().ok();
+            writeln!(log, "{}", line)?;
+            log.flush()?;
+
+            if let Event::Key(k) = &ev {
+                if k.code == KeyCode::Esc {
+                    break;
                 }
             }
         }
         Ok(())
     })();
 
-    // Always restore terminal state
-    let _ = crossterm::execute!(
-        std::io::stdout(),
-        crossterm::event::DisableMouseCapture,
-        crossterm::terminal::LeaveAlternateScreen,
-    );
-    let _ = disable_raw_mode();
+    disable_raw_mode()?;
+
+    writeln!(log, "key_dump exited")?;
+    log.flush()?;
+
+    println!();
+    println!("========================================");
+    println!(" Log written to: {}", std::env::current_dir()?.join("key_dump.log").display());
+    println!("========================================");
 
     result
 }

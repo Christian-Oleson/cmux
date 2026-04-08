@@ -1,0 +1,22 @@
+key_dump started
+Key(KeyEvent { code: Enter, modifiers: KeyModifiers(0x0), kind: Release, state: KeyEventState(0x0) })
+FocusLost
+FocusGained
+Key(KeyEvent { code: Char('a'), modifiers: KeyModifiers(0x0), kind: Press, state: KeyEventState(0x0) })
+Key(KeyEvent { code: Char('a'), modifiers: KeyModifiers(0x0), kind: Release, state: KeyEventState(0x0) })
+FocusLost
+FocusGained
+Key(KeyEvent { code: Char('b'), modifiers: KeyModifiers(CONTROL), kind: Press, state: KeyEventState(0x0) })
+Key(KeyEvent { code: Char('b'), modifiers: KeyModifiers(CONTROL), kind: Release, state: KeyEventState(0x0) })
+FocusLost
+FocusGained
+Key(KeyEvent { code: Char('%'), modifiers: KeyModifiers(SHIFT), kind: Press, state: KeyEventState(0x0) })
+Key(KeyEvent { code: Char('%'), modifiers: KeyModifiers(SHIFT), kind: Release, state: KeyEventState(0x0) })
+FocusLost
+FocusGained
+Key(KeyEvent { code: Right, modifiers: KeyModifiers(0x0), kind: Press, state: KeyEventState(0x0) })
+Key(KeyEvent { code: Right, modifiers: KeyModifiers(0x0), kind: Release, state: KeyEventState(0x0) })
+FocusLost
+FocusGained
+Key(KeyEvent { code: Esc, modifiers: KeyModifiers(0x0), kind: Press, state: KeyEventState(0x0) })
+key_dump exited
