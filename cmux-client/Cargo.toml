@@ -24,3 +24,4 @@ windows = { version = "0.61", features = [
     "Win32_Storage_FileSystem",
     "Win32_Security",
 ] }
+clipboard-win = "5"

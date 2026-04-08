@@ -1,3 +1,4 @@
+use crate::copy_mode::CopyModeState;
 use cmux_core::layout::LayoutEngine;
 use cmux_core::screen::{CellInfo, Color, ScreenBuffer, ScreenSnapshot};
 use cmux_core::types::PaneId;
@@ -19,6 +20,19 @@ pub fn render_status_bar<W: Write>(
     terminal_cols: u16,
     row: u16,
 ) -> std::io::Result<()> {
+    render_status_bar_with_mode(out, session_name, workspaces, None, terminal_cols, row)
+}
+
+/// Render the status bar with an optional right-aligned mode indicator
+/// (e.g. `[copy]`) shown while the client is in a modal state.
+pub fn render_status_bar_with_mode<W: Write>(
+    out: &mut W,
+    session_name: &str,
+    workspaces: &[(u32, String, bool)],
+    mode_indicator: Option<&str>,
+    terminal_cols: u16,
+    row: u16,
+) -> std::io::Result<()> {
     // Build the status text
     let mut text = format!("[{}] ", session_name);
     for (i, (id, name, is_active)) in workspaces.iter().enumerate() {
@@ -32,9 +46,21 @@ pub fn render_status_bar<W: Write>(
         }
     }
 
-    // Pad or truncate to fill the terminal width
     let cols = terminal_cols as usize;
-    if text.len() < cols {
+
+    // Compose the final bar: left-aligned workspaces, right-aligned mode.
+    if let Some(mode) = mode_indicator {
+        let mode_text = format!("[{}]", mode);
+        if text.len() + mode_text.len() < cols {
+            let padding = cols - text.len() - mode_text.len();
+            text.push_str(&" ".repeat(padding));
+            text.push_str(&mode_text);
+        } else if text.len() < cols {
+            text.push_str(&" ".repeat(cols - text.len()));
+        } else {
+            text.truncate(cols);
+        }
+    } else if text.len() < cols {
         text.push_str(&" ".repeat(cols - text.len()));
     } else if text.len() > cols {
         text.truncate(cols);
@@ -103,6 +129,33 @@ fn emit_cell<W: Write>(out: &mut W, row: u16, col: u16, cell: &CellInfo) -> std:
     Ok(())
 }
 
+/// Like [`emit_cell`] but forces the "reverse video" attribute so the cell
+/// appears highlighted. Used for rendering the copy-mode selection.
+fn emit_cell_highlighted<W: Write>(
+    out: &mut W,
+    row: u16,
+    col: u16,
+    cell: &CellInfo,
+) -> std::io::Result<()> {
+    out.queue(cursor::MoveTo(col, row))?;
+    let display_char = if cell.contents.is_empty() {
+        " "
+    } else {
+        &cell.contents
+    };
+    let mut style = cell_style(cell);
+    // Toggle reverse: if the cell was already inverse, un-invert it so the
+    // selection is still visibly distinct.
+    if cell.inverse {
+        style.attributes.unset(Attribute::Reverse);
+    } else {
+        style.attributes.set(Attribute::Reverse);
+    }
+    let styled = StyledContent::new(style, display_char);
+    out.queue(style::PrintStyledContent(styled))?;
+    Ok(())
+}
+
 pub struct Renderer {
     prev_snapshots: HashMap<PaneId, ScreenSnapshot>,
 }
@@ -122,6 +175,19 @@ impl Renderer {
         active_pane: PaneId,
         out: &mut W,
     ) -> std::io::Result<()> {
+        self.render_full_with_copy_mode(snapshots, layout, active_pane, None, out)
+    }
+
+    /// Full redraw, optionally highlighting a copy-mode selection on the
+    /// active pane and placing the cursor at the copy-mode cursor position.
+    pub fn render_full_with_copy_mode<W: Write>(
+        &mut self,
+        snapshots: &HashMap<PaneId, ScreenSnapshot>,
+        layout: &LayoutEngine,
+        active_pane: PaneId,
+        copy_mode: Option<&CopyModeState>,
+        out: &mut W,
+    ) -> std::io::Result<()> {
         out.queue(cursor::Hide)?;
         out.queue(style::ResetColor)?;
         out.queue(terminal::Clear(terminal::ClearType::All))?;
@@ -131,12 +197,24 @@ impl Renderer {
         // Draw each pane's contents
         for rect in &rects {
             if let Some(snapshot) = snapshots.get(&rect.pane_id) {
+                let highlight = if rect.pane_id == active_pane {
+                    copy_mode
+                } else {
+                    None
+                };
                 for (r, row) in snapshot.cells.iter().enumerate() {
                     let term_row = rect.row + r as u16;
                     for (c, cell) in row.iter().enumerate() {
                         let term_col = rect.col + c as u16;
                         if r < rect.height as usize && c < rect.width as usize {
-                            emit_cell(out, term_row, term_col, cell)?;
+                            let selected = highlight
+                                .map(|s| s.is_cell_selected(r as u16, c as u16))
+                                .unwrap_or(false);
+                            if selected {
+                                emit_cell_highlighted(out, term_row, term_col, cell)?;
+                            } else {
+                                emit_cell(out, term_row, term_col, cell)?;
+                            }
                         }
                     }
                 }
@@ -146,8 +224,12 @@ impl Renderer {
         // Draw borders
         self.draw_borders(out, layout, active_pane)?;
 
-        // Position cursor at active pane's cursor
-        self.restore_cursor(out, snapshots, &rects, active_pane)?;
+        // Position cursor
+        if let Some(copy_state) = copy_mode {
+            self.place_copy_mode_cursor(out, &rects, active_pane, copy_state)?;
+        } else {
+            self.restore_cursor(out, snapshots, &rects, active_pane)?;
+        }
 
         out.flush()?;
         self.prev_snapshots = snapshots.clone();
@@ -286,6 +368,25 @@ impl Renderer {
             }
         }
 
+        Ok(())
+    }
+
+    /// Place the terminal cursor at the copy-mode cursor position within the
+    /// active pane. The cursor is always made visible while in copy mode.
+    fn place_copy_mode_cursor<W: Write>(
+        &self,
+        out: &mut W,
+        rects: &[cmux_core::layout::PaneRect],
+        active_pane: PaneId,
+        state: &CopyModeState,
+    ) -> std::io::Result<()> {
+        out.queue(style::ResetColor)?;
+        if let Some(rect) = rects.iter().find(|r| r.pane_id == active_pane) {
+            let row = rect.row + state.cursor_row.min(rect.height.saturating_sub(1));
+            let col = rect.col + state.cursor_col.min(rect.width.saturating_sub(1));
+            out.queue(cursor::MoveTo(col, row))?;
+            out.queue(cursor::Show)?;
+        }
         Ok(())
     }
 }

@@ -1,4 +1,5 @@
 mod connection;
+mod copy_mode;
 mod pane_manager;
 mod renderer;
 mod terminal;

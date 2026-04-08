@@ -1,135 +1,96 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- Dos Apes Super Agent Framework - Phase Plan -->
 <!-- Generated: 2026-04-07 -->
-<!-- Phase: 5 -->
+<!-- Phase: 6 -->
 
 <plan>
   <metadata>
-    <phase>5</phase>
-    <name>Input System &amp; Keybindings</name>
-    <goal>Replace hardcoded prefix key handling with a configurable key table system, add mouse support</goal>
-    <deliverable>tmux-compatible keybinding system with user-customizable bindings and mouse click-to-select-pane</deliverable>
+    <phase>6</phase>
+    <name>Copy Mode &amp; Scrollback</name>
+    <goal>Scrollback buffer with vi-style copy mode, search, selection, and clipboard integration</goal>
+    <deliverable>Users can enter copy mode (Ctrl+B [), scroll back, search, select text, yank to clipboard, and paste</deliverable>
     <created>2026-04-07</created>
   </metadata>
 
   <context>
-    <dependencies>Phase 4 complete — sessions, workspaces, prefix key (hardcoded Ctrl+B), all pane operations</dependencies>
+    <dependencies>Phase 5 complete — keybinding system (Action enum, KeyTable, InputMode), mouse support</dependencies>
     <affected_areas>
-      - cmux-core: new keybinding module (Action, KeyBinding, KeyTable)
-      - cmux-client/src/terminal.rs: refactor to use key table dispatch instead of hardcoded match
-      - cmux-client/src/pane_manager.rs: add pane_at_position() for mouse click
+      - cmux-core/src/screen.rs: enable scrollback in vt100::Parser
+      - cmux-core/src/keybinding.rs: add copy mode Actions
+      - cmux-client/src/terminal.rs: CopyMode state, copy mode event routing
+      - cmux-client/src/renderer.rs: scrollback view, selection highlighting
+      - cmux-client/src/pane_manager.rs: scrollback-aware ScreenBuffer creation
+      - cmux-client/Cargo.toml: add clipboard-win dependency
     </affected_areas>
     <patterns_to_follow>
-      - KeyTable maps (KeyCode, Modifiers) -> Action in different modes (root, prefix)
-      - Actions are an enum of all possible commands (SplitH, SplitV, Close, Navigate, etc.)
-      - Terminal loop: incoming key event -> lookup in active key table -> execute action
-      - Default bindings match tmux: Ctrl+B prefix, % vertical, " horizontal, etc.
-      - Mouse: crossterm enable_mouse_capture, map click coordinates to pane via layout
+      - vt100::Parser::new(rows, cols, scrollback_lines) — third param enables scrollback
+      - vt100::Screen provides scrollback_contents_formatted() for history access
+      - InputMode enum already has Normal/WaitingForPrefixCommand — add CopyMode variant
+      - Copy mode is modal: all keys route to copy-mode handlers, not to pane
+      - Selection uses (start_row, start_col) to (cursor_row, cursor_col) range
+      - Status bar shows mode indicator when in copy mode
     </patterns_to_follow>
   </context>
 
   <tasks>
     <task id="1" type="backend" complete="false">
-      <name>Key table abstraction, default tmux bindings, and terminal refactor</name>
+      <name>Scrollback buffer, copy mode state, and keybinding additions</name>
       <description>
-        Create a keybinding module in cmux-core with Action enum, KeyBinding, and KeyTable
-        types. Define default tmux-compatible bindings. Refactor the client terminal loop
-        to dispatch keys through the key table instead of hardcoded match statements.
-        Includes unit tests for key resolution.
+        Enable scrollback in ScreenBuffer, add CopyModeState to the client,
+        extend the Action enum with copy-mode actions, and create a copy-mode
+        key table for vi-style navigation.
       </description>
 
       <files>
-        <create>
-          cmux-core/src/keybinding.rs           (Action, KeyBinding, KeyTable, defaults)
-        </create>
         <modify>
-          cmux-core/src/lib.rs                  (add pub mod keybinding)
-          cmux-client/src/terminal.rs           (refactor to use KeyTable dispatch)
+          cmux-core/src/screen.rs               (accept scrollback_size, expose scrollback access)
+          cmux-core/src/keybinding.rs            (add copy mode Action variants + copy mode key table)
+          cmux-client/src/pane_manager.rs        (pass scrollback_size when creating ScreenBuffers)
         </modify>
       </files>
 
       <action>
-        1. Create cmux-core/src/keybinding.rs:
+        1. Update cmux-core/src/screen.rs:
+           - Change ScreenBuffer::new(rows, cols) to ScreenBuffer::new(rows, cols, scrollback: usize)
+           - Pass scrollback to vt100::Parser::new(rows, cols, scrollback)
+           - Add method: pub fn scrollback_len(&amp;self) -> usize
+             * Return self.screen().scrollback().len() or similar
+           - Add method: pub fn contents_between(&amp;self, start_row: i32, end_row: i32) -> Vec&lt;String&gt;
+             * Return text content for rows, where negative rows are scrollback
+           - Update all callers of ScreenBuffer::new to pass scrollback size
+             (default: 10_000 from cmux_config::defaults::DEFAULT_SCROLLBACK)
 
-           a) Action enum — all possible multiplexer commands:
-              - SplitVertical, SplitHorizontal
-              - ClosePane
-              - ToggleZoom
-              - CyclePaneForward, CyclePaneBackward
-              - NavigateUp, NavigateDown, NavigateLeft, NavigateRight
-              - ResizePaneUp(i16), ResizePaneDown(i16), ResizePaneLeft(i16), ResizePaneRight(i16)
-              - Detach
-              - CreateWorkspace
-              - NextWorkspace, PrevWorkspace
-              - SelectWorkspace(u32) — 0-9
-              - SendPrefix — send the prefix key itself to the pane (prefix + prefix)
-              - None — no action (for unmapped keys)
+        2. Update cmux-core/src/keybinding.rs:
+           - Add Action variants:
+             * EnterCopyMode
+             * PasteFromClipboard
+           - Add CopyAction enum (separate from Action, for copy-mode-specific keys):
+             * MoveUp, MoveDown, MoveLeft, MoveRight
+             * PageUp, PageDown
+             * GotoTop, GotoBottom (g, G)
+             * StartSelection (v)
+             * Yank (y — copy selection and exit)
+             * ExitCopyMode (q or Esc)
+             * SearchForward, SearchReverse (/, ?)
+             * SearchNext, SearchPrev (n, N)
+             * MoveWordForward, MoveWordBackward (w, b)
+             * MoveLineStart, MoveLineEnd (0, $)
+           - Add CopyModeKeyTable struct:
+             * bindings: HashMap&lt;InputKey, CopyAction&gt;
+             * pub fn default_vi() -> Self — standard vi copy mode bindings
+           - Add to default_tmux(): bind '[' -> EnterCopyMode, ']' -> PasteFromClipboard
 
-           b) InputKey struct — normalized key representation:
-              - code: KeyCode (from a simple enum, not crossterm-specific)
-              - ctrl: bool, alt: bool, shift: bool
-              
-              Provide From&lt;crossterm::event::KeyEvent&gt; conversion.
-              Implement Hash, Eq for use as HashMap key.
+        3. Update cmux-client/src/pane_manager.rs:
+           - Change ScreenBuffer::new calls to pass DEFAULT_SCROLLBACK
+           - All places that create ScreenBuffer need the scrollback parameter
 
-           c) KeyTable struct:
-              - prefix_key: InputKey (default: Ctrl+B)
-              - prefix_bindings: HashMap&lt;InputKey, Action&gt; (keys after prefix)
-              - escape_time_ms: u64 (prefix timeout)
+        4. Update default constants in cmux-config/src/defaults.rs if not already there
+           (DEFAULT_SCROLLBACK = 10_000 already exists)
 
-           d) KeyTable methods:
-              - pub fn default_tmux() -> Self
-                * Builds the default keybinding table matching tmux:
-                  - % -> SplitVertical
-                  - " -> SplitHorizontal
-                  - x -> ClosePane
-                  - z -> ToggleZoom
-                  - o -> CyclePaneForward
-                  - Up -> NavigateUp, Down -> NavigateDown, Left -> NavigateLeft, Right -> NavigateRight
-                  - Ctrl+Up -> ResizePaneUp(1), etc.
-                  - d -> Detach
-                  - c -> CreateWorkspace
-                  - n -> NextWorkspace, p -> PrevWorkspace
-                  - 0-9 -> SelectWorkspace(n)
-                  - Ctrl+B -> SendPrefix
-              
-              - pub fn resolve_prefix(&amp;self, key: &amp;InputKey) -> Action
-                * Look up key in prefix_bindings, return Action or Action::None
-
-              - pub fn is_prefix(&amp;self, key: &amp;InputKey) -> bool
-                * Check if key matches prefix_key
-
-              - pub fn bind(&amp;mut self, key: InputKey, action: Action)
-              - pub fn unbind(&amp;mut self, key: &amp;InputKey)
-
-           e) Unit tests:
-              - default_tmux creates valid table
-              - resolve_prefix returns correct actions for known keys
-              - resolve_prefix returns None for unknown keys
-              - is_prefix matches Ctrl+B
-              - bind adds new binding
-              - unbind removes binding
-              - SendPrefix action resolves for double-prefix
-
-        2. Refactor cmux-client/src/terminal.rs:
-           
-           - Import KeyTable and Action from cmux_core::keybinding
-           - Create KeyTable::default_tmux() at start of run_terminal
-           - Replace InputMode::WaitingForPrefixCommand match block with:
-             ```rust
-             let input_key = InputKey::from(key_event);
-             match key_table.resolve_prefix(&amp;input_key) {
-                 Action::SplitVertical => { /* send SplitPane, update local layout */ }
-                 Action::Detach => { /* send Detach, break */ }
-                 Action::NavigateUp => { /* layout.navigate(Horizontal, false) */ }
-                 // ... etc
-                 Action::None => {} // unknown key, ignore
-             }
-             ```
-           - Replace hardcoded Ctrl+B check with key_table.is_prefix()
-           - Keep the existing action implementations (split, close, etc.) — just change how they're dispatched
-
-        3. Add pub mod keybinding to cmux-core/src/lib.rs
+        5. Unit tests:
+           - ScreenBuffer with scrollback: process enough text to create scrollback, verify scrollback_len()
+           - CopyModeKeyTable: default_vi creates valid bindings
+           - CopyAction resolution for hjkl, v, y, q, /, ?
       </action>
 
       <verification>
@@ -139,61 +100,118 @@
       </verification>
 
       <done>
-        - KeyTable abstraction with default tmux bindings
-        - Terminal loop uses key table dispatch (no hardcoded key matching)
-        - Prefix key is configurable via KeyTable (not hardcoded Ctrl+B)
-        - bind/unbind support for future configuration
-        - 7+ unit tests for key resolution
-        - All existing functionality works identically
-        - All tests pass
+        - ScreenBuffer accepts scrollback_size, vt100 stores scrollback history
+        - Action::EnterCopyMode and Action::PasteFromClipboard added
+        - CopyAction enum with vi-style navigation actions
+        - CopyModeKeyTable::default_vi() creates standard vi bindings
+        - All existing tests pass with updated ScreenBuffer::new calls
+        - New tests for scrollback and copy mode keybindings
       </done>
     </task>
 
-    <task id="2" type="backend" complete="false">
-      <name>Mouse click to select pane and basic mouse support</name>
+    <task id="2" type="integration" complete="false">
+      <name>Copy mode UI, selection rendering, clipboard integration, and search</name>
       <description>
-        Enable crossterm mouse capture, handle mouse click events to select
-        the pane under the cursor, and handle mouse wheel events. Add
-        pane_at_position() to PaneManager for coordinate-to-pane mapping.
+        Implement the full copy mode experience: enter/exit copy mode, vi-style
+        scrollback navigation, visual text selection with highlighting, yank to
+        Windows clipboard, paste from clipboard, and search within scrollback.
       </description>
 
       <files>
+        <create>
+          cmux-client/src/copy_mode.rs          (CopyModeState, selection logic, text extraction)
+        </create>
         <modify>
-          cmux-client/src/terminal.rs           (enable mouse capture, handle mouse events)
-          cmux-client/src/pane_manager.rs        (add pane_at_position method)
-          cmux-client/src/renderer.rs            (re-render borders on active pane change)
+          cmux-client/Cargo.toml                (add clipboard-win)
+          cmux-client/src/terminal.rs           (CopyMode input routing, enter/exit)
+          cmux-client/src/renderer.rs           (selection highlighting, scrollback rendering, mode indicator)
+          cmux-client/src/main.rs               (add mod copy_mode)
         </modify>
       </files>
 
       <action>
-        1. Add pane_at_position to cmux-client/src/pane_manager.rs:
-           - pub fn pane_at_position(&amp;self, row: u16, col: u16) -> Option&lt;PaneId&gt;
-             * Get pane_rects from layout
-             * Find which rect contains (row, col)
-             * Return the pane_id
+        1. Create cmux-client/src/copy_mode.rs:
+           - CopyModeState struct:
+             * scroll_offset: usize (lines scrolled up from current)
+             * cursor_row: u16, cursor_col: u16 (copy-mode cursor position)
+             * selection_anchor: Option&lt;(u16, u16)&gt; (where 'v' was pressed)
+             * search_query: String
+             * search_direction: SearchDirection (Forward/Reverse)
 
-        2. Update cmux-client/src/terminal.rs:
+           - pub fn new(cursor_row: u16, cursor_col: u16) -> Self
+           - pub fn move_cursor(&amp;mut self, dr: i16, dc: i16, max_row: u16, max_col: u16)
+           - pub fn page_up/page_down(&amp;mut self, page_size: u16)
+           - pub fn goto_top/goto_bottom(&amp;mut self, scrollback_len: usize)
+           - pub fn toggle_selection(&amp;mut self) — toggle selection_anchor
+           - pub fn selection_range(&amp;self) -> Option&lt;((u16,u16), (u16,u16))&gt;
+           - pub fn extract_text(&amp;self, screen: &amp;ScreenBuffer) -> String
+             * Collect text content from selection range
+
+        2. Add clipboard-win to cmux-client/Cargo.toml:
+           ```toml
+           [target.'cfg(windows)'.dependencies]
+           clipboard-win = "5"
+           ```
+
+        3. Update cmux-client/src/terminal.rs:
+           - Add CopyMode variant to InputMode:
+             ```rust
+             enum InputMode {
+                 Normal,
+                 WaitingForPrefixCommand,
+                 CopyMode(CopyModeState),
+             }
+             ```
+           - On Action::EnterCopyMode:
+             * Create CopyModeState with current cursor position
+             * Set input_mode = InputMode::CopyMode(state)
+           - In CopyMode: route keys through CopyModeKeyTable:
+             * hjkl/arrows: move cursor
+             * Ctrl+u/d: page up/down
+             * g/G: goto top/bottom
+             * v: toggle selection
+             * y: yank selection to clipboard, exit copy mode
+             * q/Esc: exit copy mode
+             * /: enter search forward mode (read search query)
+             * n/N: next/prev search match
+           - On Action::PasteFromClipboard:
+             * Read clipboard, send as PaneInput to daemon
+           - After each copy-mode action: re-render with selection highlighting
+
+        4. Update cmux-client/src/renderer.rs:
+           - Add render method for copy mode:
+             * Show scrollback content at scroll_offset
+             * Highlight selected cells with inverse video
+             * Show copy-mode cursor at cursor_row, cursor_col
+           - Update status bar to show "[copy]" when in copy mode
+           - Add scroll position indicator: "[42/10000]"
+
+        5. Clipboard integration (Windows):
+           ```rust
+           #[cfg(windows)]
+           fn copy_to_clipboard(text: &amp;str) -> Result&lt;()&gt; {
+               clipboard_win::set_clipboard_string(text)?;
+               Ok(())
+           }
            
-           a) Enable mouse capture at start of run_terminal:
-              * crossterm::event::EnableMouseCapture
-              * Add to RawModeGuard Drop: DisableMouseCapture
+           #[cfg(windows)]
+           fn paste_from_clipboard() -> Result&lt;String&gt; {
+               Ok(clipboard_win::get_clipboard_string()?)
+           }
+           ```
 
-           b) Handle mouse events in the main event loop:
-              * Event::Mouse(MouseEvent { kind, column, row, .. }) =>
-                - MouseEventKind::Down(MouseButton::Left):
-                  * Call panes.pane_at_position(row, column)
-                  * If found and different from active, set as active pane
-                  * Re-render to update border highlighting
-                - MouseEventKind::ScrollUp / ScrollDown:
-                  * Forward as key sequences to active pane (Up/Down arrows for now)
-                  * Copy mode scrollback will be added in Phase 6
+        6. Search implementation (basic):
+           - On '/' in copy mode: read characters until Enter (mini input mode)
+           - Search through scrollback + screen content for matches
+           - Jump cursor to first match
+           - 'n' goes to next match, 'N' goes to previous
 
-           c) Forward mouse events to pane when pane application requests mouse:
-              * For now, forward all mouse events as SGR mouse escape sequences
-              * Convert crossterm mouse coordinates to pane-relative coordinates
-              * Only forward if click is within the active pane bounds
+        7. Bracketed paste support:
+           - When pasting, wrap text in bracketed paste escape sequences:
+             \x1b[200~ ... text ... \x1b[201~
+           - This prevents shells from executing pasted commands prematurely
 
-        3. Add unit test for pane_at_position in pane_manager.rs
+        8. Add mod copy_mode to main.rs
       </action>
 
       <verification>
@@ -203,17 +221,24 @@
         <command>cargo test --workspace</command>
         <manual>
           1. Start daemon + client
-          2. Split panes (Ctrl+B %)
-          3. Click on inactive pane with mouse → it becomes active (border changes)
-          4. Mouse wheel scrolls (sends arrow keys for now)
+          2. Run some commands to generate scrollback
+          3. Press Ctrl+B [ → enter copy mode
+          4. Navigate with hjkl, Ctrl+u/d → scroll through history
+          5. Press v to start selection, move cursor → text highlighted
+          6. Press y → text copied to clipboard, exits copy mode
+          7. Press Ctrl+B ] → paste from clipboard into pane
+          8. Press / in copy mode, type search term → cursor jumps to match
         </manual>
       </verification>
 
       <done>
-        - Mouse click selects pane (active pane changes, borders update)
-        - Mouse capture enabled/disabled cleanly
-        - pane_at_position correctly maps coordinates to panes
-        - Mouse wheel sends scroll input
+        - Ctrl+B [ enters copy mode, q/Esc exits
+        - Vi-style navigation (hjkl, Ctrl+u/d, g, G, w, b, 0, $)
+        - Visual selection (v toggle) with highlighted rendering
+        - Yank (y) copies selection to Windows clipboard
+        - Paste (Ctrl+B ]) reads clipboard and sends to pane with bracketed paste
+        - Search (/, ?, n, N) within scrollback
+        - Status bar shows [copy] indicator and scroll position
         - All tests pass
       </done>
     </task>
@@ -227,17 +252,20 @@
       <command>cargo test --workspace</command>
     </commands>
     <manual>
-      1. All existing prefix keys still work (%, ", x, z, o, d, c, n, p, 0-9, arrows)
-      2. Mouse click selects pane
-      3. Terminal still restores cleanly on exit
+      1. Generate scrollback (run several commands)
+      2. Enter copy mode, navigate, select, yank → clipboard works
+      3. Paste from clipboard → text appears in pane
+      4. Search in scrollback → cursor jumps to match
+      5. Exit copy mode → returns to normal input
     </manual>
   </phase_verification>
 
   <completion_criteria>
     <criterion>All 2 tasks marked complete</criterion>
     <criterion>cargo build/clippy/fmt/test all pass</criterion>
-    <criterion>Key dispatch through KeyTable (not hardcoded match)</criterion>
-    <criterion>Mouse click selects pane</criterion>
-    <criterion>All existing keybindings work identically</criterion>
+    <criterion>Copy mode with vi navigation works</criterion>
+    <criterion>Selection and yank to clipboard works</criterion>
+    <criterion>Paste from clipboard works</criterion>
+    <criterion>Search within scrollback works</criterion>
   </completion_criteria>
 </plan>

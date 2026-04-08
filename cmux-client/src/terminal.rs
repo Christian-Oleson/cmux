@@ -1,6 +1,9 @@
+use crate::copy_mode::CopyModeState;
 use crate::pane_manager::PaneManager;
 use crate::renderer::{self, Renderer};
-use cmux_core::keybinding::{Action, InputKey, KeyCode as CmuxKeyCode, KeyTable};
+use cmux_core::keybinding::{
+    Action, CopyAction, CopyModeKeyTable, InputKey, KeyCode as CmuxKeyCode, KeyTable,
+};
 use cmux_core::layout::SplitDirection;
 use cmux_core::types::PaneId;
 use cmux_ipc::messages::{ClientMessage, ServerMessage};
@@ -18,12 +21,14 @@ use tracing::debug;
 enum InputMode {
     Normal,
     WaitingForPrefixCommand,
+    CopyMode(CopyModeState),
 }
 
 /// Action returned from prefix command handling that the main loop must act on.
 enum PrefixAction {
     None,
     Detach,
+    EnterCopyMode,
 }
 
 struct RawModeGuard;
@@ -71,6 +76,7 @@ where
     let mut input_mode = InputMode::Normal;
     let mut event_stream = EventStream::new();
     let key_table = KeyTable::default_tmux();
+    let copy_mode_table = CopyModeKeyTable::default_vi();
 
     // Initial full render with status bar
     {
@@ -92,7 +98,7 @@ where
             event = event_stream.next() => {
                 match event {
                     Some(Ok(Event::Key(key_event))) => {
-                        match input_mode {
+                        match &mut input_mode {
                             InputMode::Normal => {
                                 // Check for prefix key
                                 if key_table.is_prefix(&to_input_key(&key_event)) {
@@ -123,6 +129,105 @@ where
                                 match action {
                                     PrefixAction::Detach => break,
                                     PrefixAction::None => {}
+                                    PrefixAction::EnterCopyMode => {
+                                        let (term_cols, term_rows) =
+                                            crossterm::terminal::size()?;
+                                        let status_row = term_rows.saturating_sub(1);
+                                        let state =
+                                            build_copy_mode_state(&panes);
+                                        input_mode = InputMode::CopyMode(state);
+                                        if let InputMode::CopyMode(ref state) = input_mode {
+                                            render_copy_mode(
+                                                &mut renderer,
+                                                &panes,
+                                                state,
+                                                &mut std::io::stdout().lock(),
+                                                term_cols,
+                                                status_row,
+                                            )?;
+                                        }
+                                    }
+                                }
+                            }
+                            InputMode::CopyMode(state) => {
+                                let input_key = to_input_key(&key_event);
+                                if let Some(action) = copy_mode_table.resolve(&input_key) {
+                                    let (term_cols, term_rows) = crossterm::terminal::size()?;
+                                    let status_row = term_rows.saturating_sub(1);
+                                    let mut exit = false;
+                                    match action {
+                                        CopyAction::MoveLeft => state.move_cursor(0, -1),
+                                        CopyAction::MoveRight => state.move_cursor(0, 1),
+                                        CopyAction::MoveUp => state.move_cursor(-1, 0),
+                                        CopyAction::MoveDown => state.move_cursor(1, 0),
+                                        CopyAction::PageUp => {
+                                            let page = state.max_row / 2;
+                                            state.page_up(page.max(1));
+                                        }
+                                        CopyAction::PageDown => {
+                                            let page = state.max_row / 2;
+                                            state.page_down(page.max(1));
+                                        }
+                                        CopyAction::GotoTop => state.goto_top(),
+                                        CopyAction::GotoBottom => state.goto_bottom(),
+                                        CopyAction::StartSelection => state.toggle_selection(),
+                                        CopyAction::Yank => {
+                                            // Copy the selected text (if any) to the
+                                            // clipboard and leave copy mode.
+                                            let active = panes.active_pane();
+                                            let snaps = panes.snapshots();
+                                            if let Some(snap) = snaps.get(&active) {
+                                                let text = state.extract_text_from_snapshot(snap);
+                                                if !text.is_empty() {
+                                                    if let Err(e) = clipboard_set(&text) {
+                                                        debug!(error = %e, "clipboard write failed");
+                                                    }
+                                                }
+                                            }
+                                            exit = true;
+                                        }
+                                        CopyAction::ExitCopyMode => exit = true,
+                                        CopyAction::SearchForward
+                                        | CopyAction::SearchReverse
+                                        | CopyAction::SearchNext
+                                        | CopyAction::SearchPrev => {
+                                            // Search is a stub for now; a future
+                                            // change will implement the mini-input
+                                            // mode and scrollback search.
+                                        }
+                                    }
+
+                                    if exit {
+                                        input_mode = InputMode::Normal;
+                                        let snaps = panes.snapshots();
+                                        let mut stdout = std::io::stdout().lock();
+                                        renderer.render_full(
+                                            &snaps,
+                                            panes.layout(),
+                                            panes.active_pane(),
+                                            &mut stdout,
+                                        )?;
+                                        renderer::render_status_bar(
+                                            &mut stdout,
+                                            panes.session_name(),
+                                            &panes.workspace_list(),
+                                            term_cols,
+                                            status_row,
+                                        )?;
+                                        stdout.flush()?;
+                                    } else {
+                                        // Re-render with the updated copy-mode state.
+                                        if let InputMode::CopyMode(ref state) = input_mode {
+                                            render_copy_mode(
+                                                &mut renderer,
+                                                &panes,
+                                                state,
+                                                &mut std::io::stdout().lock(),
+                                                term_cols,
+                                                status_row,
+                                            )?;
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -594,12 +699,103 @@ async fn handle_prefix_command<W: AsyncWrite + Unpin>(
             transport::write_message(pipe_writer, &msg).await?;
         }
 
+        Some(Action::EnterCopyMode) => {
+            return Ok(PrefixAction::EnterCopyMode);
+        }
+
+        Some(Action::PasteFromClipboard) => match clipboard_get() {
+            Ok(text) if !text.is_empty() => {
+                // Wrap paste in bracketed paste escape sequences so that
+                // shells that support it (most modern ones) won't
+                // interpret newlines as commands.
+                let mut data = Vec::with_capacity(text.len() + 12);
+                data.extend_from_slice(b"\x1b[200~");
+                data.extend_from_slice(text.as_bytes());
+                data.extend_from_slice(b"\x1b[201~");
+                let msg = ClientMessage::PaneInput {
+                    pane_id: panes.active_pane().0,
+                    data,
+                };
+                transport::write_message(pipe_writer, &msg).await?;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                debug!(error = %e, "clipboard read failed");
+            }
+        },
+
         None => {
             // Unknown prefix command -- ignore
         }
     }
 
     Ok(PrefixAction::None)
+}
+
+/// Build a fresh [`CopyModeState`] for the active pane using its current
+/// dimensions and cursor position.
+fn build_copy_mode_state(panes: &PaneManager) -> CopyModeState {
+    let active = panes.active_pane();
+    let snaps = panes.snapshots();
+    if let Some(snap) = snaps.get(&active) {
+        CopyModeState::new(snap.cursor_row, snap.cursor_col, snap.rows, snap.cols)
+    } else {
+        CopyModeState::new(0, 0, 24, 80)
+    }
+}
+
+/// Re-render the full pane layout with copy-mode selection highlighting and
+/// the copy-mode indicator in the status bar.
+fn render_copy_mode<W: Write>(
+    renderer: &mut Renderer,
+    panes: &PaneManager,
+    state: &CopyModeState,
+    out: &mut W,
+    terminal_cols: u16,
+    status_row: u16,
+) -> std::io::Result<()> {
+    let snaps = panes.snapshots();
+    renderer.render_full_with_copy_mode(
+        &snaps,
+        panes.layout(),
+        panes.active_pane(),
+        Some(state),
+        out,
+    )?;
+    renderer::render_status_bar_with_mode(
+        out,
+        panes.session_name(),
+        &panes.workspace_list(),
+        Some("copy"),
+        terminal_cols,
+        status_row,
+    )?;
+    out.flush()?;
+    Ok(())
+}
+
+/// Copy the given text to the Windows clipboard.
+#[cfg(windows)]
+fn clipboard_set(text: &str) -> Result<(), String> {
+    use clipboard_win::{formats, set_clipboard};
+    set_clipboard(formats::Unicode, text).map_err(|e| e.to_string())
+}
+
+/// Read a UTF-8 string from the Windows clipboard.
+#[cfg(windows)]
+fn clipboard_get() -> Result<String, String> {
+    use clipboard_win::{formats, get_clipboard};
+    get_clipboard(formats::Unicode).map_err(|e| e.to_string())
+}
+
+#[cfg(not(windows))]
+fn clipboard_set(_text: &str) -> Result<(), String> {
+    Err("clipboard not supported on this platform".into())
+}
+
+#[cfg(not(windows))]
+fn clipboard_get() -> Result<String, String> {
+    Err("clipboard not supported on this platform".into())
 }
 
 /// Convert a crossterm [`KeyEvent`] into a crossterm-independent [`InputKey`].

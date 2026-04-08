@@ -25,7 +25,10 @@ impl PaneManager {
     pub fn new_with_session(session_name: String, rows: u16, cols: u16) -> Self {
         let layout = LayoutEngine::new(rows, cols);
         let mut screens = HashMap::new();
-        screens.insert(PaneId(0), ScreenBuffer::new(rows, cols));
+        screens.insert(
+            PaneId(0),
+            ScreenBuffer::new(rows, cols, cmux_config::defaults::DEFAULT_SCROLLBACK),
+        );
 
         let ws_state = WorkspaceState { layout, screens };
         let mut workspaces = HashMap::new();
@@ -79,8 +82,14 @@ impl PaneManager {
         // Create screen buffer for new pane
         let rects = ws.layout.pane_rects();
         if let Some(rect) = rects.iter().find(|r| r.pane_id == new_pane_id) {
-            ws.screens
-                .insert(new_pane_id, ScreenBuffer::new(rect.height, rect.width));
+            ws.screens.insert(
+                new_pane_id,
+                ScreenBuffer::new(
+                    rect.height,
+                    rect.width,
+                    cmux_config::defaults::DEFAULT_SCROLLBACK,
+                ),
+            );
         }
 
         new_pane_id
@@ -175,7 +184,10 @@ impl PaneManager {
 
         let layout = LayoutEngine::new_with_pane_id(rows, cols, pane_id);
         let mut screens = HashMap::new();
-        screens.insert(pane_id, ScreenBuffer::new(rows, cols));
+        screens.insert(
+            pane_id,
+            ScreenBuffer::new(rows, cols, cmux_config::defaults::DEFAULT_SCROLLBACK),
+        );
 
         self.workspaces
             .insert(ws_id, WorkspaceState { layout, screens });
@@ -242,7 +254,10 @@ impl PaneManager {
             // just pane ids. For now, create the primary pane and screen.
             // The daemon will send output that will populate the screens.
             for &pid in &ws_info.pane_ids {
-                screens.insert(PaneId(pid), ScreenBuffer::new(rows, cols));
+                screens.insert(
+                    PaneId(pid),
+                    ScreenBuffer::new(rows, cols, cmux_config::defaults::DEFAULT_SCROLLBACK),
+                );
             }
 
             ws_map.insert(ws_info.id, WorkspaceState { layout, screens });
@@ -253,7 +268,10 @@ impl PaneManager {
         if ws_map.is_empty() {
             let layout = LayoutEngine::new(rows, cols);
             let mut screens = HashMap::new();
-            screens.insert(PaneId(0), ScreenBuffer::new(rows, cols));
+            screens.insert(
+                PaneId(0),
+                ScreenBuffer::new(rows, cols, cmux_config::defaults::DEFAULT_SCROLLBACK),
+            );
             ws_map.insert(0, WorkspaceState { layout, screens });
             ws_names.insert(0, "0".into());
         }
