@@ -1,223 +1,199 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- Dos Apes Super Agent Framework - Phase Plan -->
 <!-- Generated: 2026-04-07 -->
-<!-- Phase: 4 -->
+<!-- Phase: 5 -->
 
 <plan>
   <metadata>
-    <phase>4</phase>
-    <name>Sessions &amp; Workspaces</name>
-    <goal>Support multiple named sessions with detach/reattach, tabbed workspaces, and a status bar</goal>
-    <deliverable>Users can create sessions, detach (Ctrl+B d), reattach, switch workspaces (tabs), and see session info in a status bar</deliverable>
+    <phase>5</phase>
+    <name>Input System &amp; Keybindings</name>
+    <goal>Replace hardcoded prefix key handling with a configurable key table system, add mouse support</goal>
+    <deliverable>tmux-compatible keybinding system with user-customizable bindings and mouse click-to-select-pane</deliverable>
     <created>2026-04-07</created>
   </metadata>
 
   <context>
-    <dependencies>Phase 3 complete — layout engine, multi-pane, prefix keys, daemon multi-pane IPC</dependencies>
+    <dependencies>Phase 4 complete — sessions, workspaces, prefix key (hardcoded Ctrl+B), all pane operations</dependencies>
     <affected_areas>
-      - cmux-core/src/types.rs: Already has Session/Workspace/WorkspaceId types (unused) — wire them in
-      - cmux-daemon/src/session_manager.rs: Refactor to nest workspaces in sessions
-      - cmux-daemon/src/server.rs: Handle workspace messages, session state query
-      - cmux-ipc/src/messages.rs: New workspace + session state messages
-      - cmux-client/src/terminal.rs: Detach, workspace prefix keys, status bar
-      - cmux-client/src/pane_manager.rs: Workspace-aware pane management
-      - cmux-client/src/renderer.rs: Status bar rendering
+      - cmux-core: new keybinding module (Action, KeyBinding, KeyTable)
+      - cmux-client/src/terminal.rs: refactor to use key table dispatch instead of hardcoded match
+      - cmux-client/src/pane_manager.rs: add pane_at_position() for mouse click
     </affected_areas>
     <patterns_to_follow>
-      - Daemon is source of truth for session/workspace/pane state
-      - On attach, daemon sends full state snapshot, client rebuilds UI
-      - Ctrl+B d = detach (daemon keeps everything alive)
-      - Ctrl+B c = new workspace, Ctrl+B n/p = next/prev workspace, Ctrl+B 0-9 = select by index
-      - Status bar at terminal bottom (1 row reserved from layout)
-      - Workspace = independent pane layout tree with its own set of panes
+      - KeyTable maps (KeyCode, Modifiers) -> Action in different modes (root, prefix)
+      - Actions are an enum of all possible commands (SplitH, SplitV, Close, Navigate, etc.)
+      - Terminal loop: incoming key event -> lookup in active key table -> execute action
+      - Default bindings match tmux: Ctrl+B prefix, % vertical, " horizontal, etc.
+      - Mouse: crossterm enable_mouse_capture, map click coordinates to pane via layout
     </patterns_to_follow>
   </context>
 
   <tasks>
     <task id="1" type="backend" complete="false">
-      <name>Daemon workspace model, session state query, and detach/reattach</name>
+      <name>Key table abstraction, default tmux bindings, and terminal refactor</name>
       <description>
-        Refactor the daemon to support workspaces (tabs) within sessions. Each workspace
-        has its own set of panes with independent ConPTY processes. Add a session state
-        query so clients can rebuild their UI on reattach. Implement clean detach
-        (daemon keeps panes alive) and reattach (daemon sends current state).
+        Create a keybinding module in cmux-core with Action enum, KeyBinding, and KeyTable
+        types. Define default tmux-compatible bindings. Refactor the client terminal loop
+        to dispatch keys through the key table instead of hardcoded match statements.
+        Includes unit tests for key resolution.
       </description>
 
       <files>
+        <create>
+          cmux-core/src/keybinding.rs           (Action, KeyBinding, KeyTable, defaults)
+        </create>
         <modify>
-          cmux-ipc/src/messages.rs              (add workspace + session state messages)
-          cmux-daemon/src/session_manager.rs    (workspace model, state query, per-workspace pane tracking)
-          cmux-daemon/src/server.rs             (handle new messages, state query on attach)
+          cmux-core/src/lib.rs                  (add pub mod keybinding)
+          cmux-client/src/terminal.rs           (refactor to use KeyTable dispatch)
         </modify>
       </files>
 
       <action>
-        1. Add new IPC messages to cmux-ipc/src/messages.rs:
+        1. Create cmux-core/src/keybinding.rs:
 
-           ClientMessage additions:
-           - CreateWorkspace
-           - CloseWorkspace { workspace_id: u32 }
-           - SwitchWorkspace { workspace_id: u32 }
-           - GetSessionState
+           a) Action enum — all possible multiplexer commands:
+              - SplitVertical, SplitHorizontal
+              - ClosePane
+              - ToggleZoom
+              - CyclePaneForward, CyclePaneBackward
+              - NavigateUp, NavigateDown, NavigateLeft, NavigateRight
+              - ResizePaneUp(i16), ResizePaneDown(i16), ResizePaneLeft(i16), ResizePaneRight(i16)
+              - Detach
+              - CreateWorkspace
+              - NextWorkspace, PrevWorkspace
+              - SelectWorkspace(u32) — 0-9
+              - SendPrefix — send the prefix key itself to the pane (prefix + prefix)
+              - None — no action (for unmapped keys)
 
-           ServerMessage additions:
-           - WorkspaceCreated { workspace_id: u32, name: String }
-           - WorkspaceClosed { workspace_id: u32 }
-           - WorkspaceSwitched { workspace_id: u32 }
-           - SessionState { session_name: String, workspaces: Vec&lt;WorkspaceInfo&gt;, active_workspace: u32 }
-           - Detached
+           b) InputKey struct — normalized key representation:
+              - code: KeyCode (from a simple enum, not crossterm-specific)
+              - ctrl: bool, alt: bool, shift: bool
+              
+              Provide From&lt;crossterm::event::KeyEvent&gt; conversion.
+              Implement Hash, Eq for use as HashMap key.
 
-           New struct WorkspaceInfo:
-           - id: u32
-           - name: String
-           - pane_ids: Vec&lt;u32&gt;
+           c) KeyTable struct:
+              - prefix_key: InputKey (default: Ctrl+B)
+              - prefix_bindings: HashMap&lt;InputKey, Action&gt; (keys after prefix)
+              - escape_time_ms: u64 (prefix timeout)
 
-        2. Refactor cmux-daemon/src/session_manager.rs:
+           d) KeyTable methods:
+              - pub fn default_tmux() -> Self
+                * Builds the default keybinding table matching tmux:
+                  - % -> SplitVertical
+                  - " -> SplitHorizontal
+                  - x -> ClosePane
+                  - z -> ToggleZoom
+                  - o -> CyclePaneForward
+                  - Up -> NavigateUp, Down -> NavigateDown, Left -> NavigateLeft, Right -> NavigateRight
+                  - Ctrl+Up -> ResizePaneUp(1), etc.
+                  - d -> Detach
+                  - c -> CreateWorkspace
+                  - n -> NextWorkspace, p -> PrevWorkspace
+                  - 0-9 -> SelectWorkspace(n)
+                  - Ctrl+B -> SendPrefix
+              
+              - pub fn resolve_prefix(&amp;self, key: &amp;InputKey) -> Action
+                * Look up key in prefix_bindings, return Action or Action::None
 
-           - Add ManagedWorkspace struct:
-             * id: u32
-             * name: String
-             * panes: HashMap&lt;u32, ManagedPane&gt;
+              - pub fn is_prefix(&amp;self, key: &amp;InputKey) -> bool
+                * Check if key matches prefix_key
 
-           - Modify ManagedSession to contain workspaces:
-             * workspaces: HashMap&lt;u32, ManagedWorkspace&gt;
-             * active_workspace: u32
-             * next_workspace_id: u32
-             * next_pane_id: u32 (global across all workspaces)
+              - pub fn bind(&amp;mut self, key: InputKey, action: Action)
+              - pub fn unbind(&amp;mut self, key: &amp;InputKey)
 
-           - create_session: create initial workspace 0 with initial pane 0
+           e) Unit tests:
+              - default_tmux creates valid table
+              - resolve_prefix returns correct actions for known keys
+              - resolve_prefix returns None for unknown keys
+              - is_prefix matches Ctrl+B
+              - bind adds new binding
+              - unbind removes binding
+              - SendPrefix action resolves for double-prefix
 
-           - split_pane(session, cols, rows): split in active workspace
+        2. Refactor cmux-client/src/terminal.rs:
+           
+           - Import KeyTable and Action from cmux_core::keybinding
+           - Create KeyTable::default_tmux() at start of run_terminal
+           - Replace InputMode::WaitingForPrefixCommand match block with:
+             ```rust
+             let input_key = InputKey::from(key_event);
+             match key_table.resolve_prefix(&amp;input_key) {
+                 Action::SplitVertical => { /* send SplitPane, update local layout */ }
+                 Action::Detach => { /* send Detach, break */ }
+                 Action::NavigateUp => { /* layout.navigate(Horizontal, false) */ }
+                 // ... etc
+                 Action::None => {} // unknown key, ignore
+             }
+             ```
+           - Replace hardcoded Ctrl+B check with key_table.is_prefix()
+           - Keep the existing action implementations (split, close, etc.) — just change how they're dispatched
 
-           - close_pane(session, pane_id): close in appropriate workspace
-
-           - send_input(session, pane_id, data): route to correct pane across workspaces
-
-           - create_workspace(session) -> (workspace_id, pane_id):
-             * Create new workspace with a fresh shell pane
-             * Set as active workspace
-             * Return workspace_id and initial pane_id
-
-           - close_workspace(session, workspace_id):
-             * Kill all panes in workspace
-             * Remove workspace
-             * If active workspace was closed, switch to another
-
-           - switch_workspace(session, workspace_id):
-             * Set active_workspace
-             * Return workspace_id
-
-           - get_session_state(session) -> SessionState:
-             * Return all workspace IDs, names, pane IDs, active workspace
-
-        3. Update cmux-daemon/src/server.rs:
-
-           - Handle CreateWorkspace: call session_manager.create_workspace(), respond with WorkspaceCreated + PaneCreated
-           - Handle CloseWorkspace: call close_workspace(), respond with WorkspaceClosed
-           - Handle SwitchWorkspace: call switch_workspace(), respond with WorkspaceSwitched
-           - Handle GetSessionState: call get_session_state(), respond with SessionState
-           - Handle Detach: abort output task, clear attached_session, respond with Detached
-           - On Attach: auto-send SessionState so client can rebuild UI
+        3. Add pub mod keybinding to cmux-core/src/lib.rs
       </action>
 
       <verification>
         <command>cargo build --workspace</command>
-        <command>cargo clippy --workspace</command>
         <command>cargo test --workspace</command>
+        <command>cargo clippy --workspace</command>
       </verification>
 
       <done>
-        - Daemon supports multiple workspaces per session
-        - Workspace create/close/switch operations work
-        - Session state query returns full workspace + pane information
-        - Detach cleanly disconnects client while daemon keeps panes alive
-        - Attach sends session state for client rebuilding
-        - All existing tests pass
+        - KeyTable abstraction with default tmux bindings
+        - Terminal loop uses key table dispatch (no hardcoded key matching)
+        - Prefix key is configurable via KeyTable (not hardcoded Ctrl+B)
+        - bind/unbind support for future configuration
+        - 7+ unit tests for key resolution
+        - All existing functionality works identically
+        - All tests pass
       </done>
     </task>
 
-    <task id="2" type="integration" complete="false">
-      <name>Client workspace UI, detach, reattach, and status bar</name>
+    <task id="2" type="backend" complete="false">
+      <name>Mouse click to select pane and basic mouse support</name>
       <description>
-        Implement the client-side workspace management: Ctrl+B d to detach, reattach
-        that rebuilds UI from daemon state, workspace prefix keys (Ctrl+B c/n/p/0-9),
-        and a status bar at the bottom showing session name and workspace list.
+        Enable crossterm mouse capture, handle mouse click events to select
+        the pane under the cursor, and handle mouse wheel events. Add
+        pane_at_position() to PaneManager for coordinate-to-pane mapping.
       </description>
 
       <files>
         <modify>
-          cmux-client/src/terminal.rs           (detach, workspace prefix keys, status bar area)
-          cmux-client/src/pane_manager.rs        (workspace switching, rebuild from state)
-          cmux-client/src/renderer.rs            (status bar rendering, reserve bottom row)
-          cmux-client/src/main.rs                (attach flow: query state, rebuild)
+          cmux-client/src/terminal.rs           (enable mouse capture, handle mouse events)
+          cmux-client/src/pane_manager.rs        (add pane_at_position method)
+          cmux-client/src/renderer.rs            (re-render borders on active pane change)
         </modify>
       </files>
 
       <action>
-        1. Update cmux-client/src/pane_manager.rs:
+        1. Add pane_at_position to cmux-client/src/pane_manager.rs:
+           - pub fn pane_at_position(&amp;self, row: u16, col: u16) -> Option&lt;PaneId&gt;
+             * Get pane_rects from layout
+             * Find which rect contains (row, col)
+             * Return the pane_id
 
-           - Add workspace tracking:
-             * workspaces: HashMap&lt;u32, LayoutEngine&gt; + HashMap&lt;u32, HashMap&lt;PaneId, ScreenBuffer&gt;&gt;
-             * active_workspace: u32
-             * workspace_names: HashMap&lt;u32, String&gt;
+        2. Update cmux-client/src/terminal.rs:
+           
+           a) Enable mouse capture at start of run_terminal:
+              * crossterm::event::EnableMouseCapture
+              * Add to RawModeGuard Drop: DisableMouseCapture
 
-           - new() creates workspace 0 with initial pane
+           b) Handle mouse events in the main event loop:
+              * Event::Mouse(MouseEvent { kind, column, row, .. }) =>
+                - MouseEventKind::Down(MouseButton::Left):
+                  * Call panes.pane_at_position(row, column)
+                  * If found and different from active, set as active pane
+                  * Re-render to update border highlighting
+                - MouseEventKind::ScrollUp / ScrollDown:
+                  * Forward as key sequences to active pane (Up/Down arrows for now)
+                  * Copy mode scrollback will be added in Phase 6
 
-           - switch_workspace(workspace_id): swap active LayoutEngine + screens
+           c) Forward mouse events to pane when pane application requests mouse:
+              * For now, forward all mouse events as SGR mouse escape sequences
+              * Convert crossterm mouse coordinates to pane-relative coordinates
+              * Only forward if click is within the active pane bounds
 
-           - create_workspace(workspace_id, pane_id, name): create new LayoutEngine + initial screen
-
-           - close_workspace(workspace_id): remove workspace data
-
-           - rebuild_from_state(session_state: SessionState): rebuild all workspaces from daemon state
-             * Used on reattach
-
-           - Existing split/close/process_output/snapshots work on active workspace
-
-           - workspace_list() -> Vec&lt;(u32, String, bool)&gt;: return (id, name, is_active) for status bar
-
-        2. Update cmux-client/src/renderer.rs:
-
-           - Add status bar rendering:
-             * Reserve 1 row at bottom of terminal for status bar
-             * Status bar format: " [session] 0:workspace0 | 1:workspace1* | 2:workspace2 "
-             * Active workspace marked with * and highlighted
-             * Status bar has inverse video (bg: white/grey, fg: black)
-
-           - fn render_status_bar(out, session_name, workspaces: &amp;[(u32, String, bool)], terminal_cols, terminal_row)
-             * Draw inverse-colored bar at the specified row
-
-           - Adjust render_full/render_diff to pass status bar info
-
-        3. Update cmux-client/src/terminal.rs:
-
-           a) Detach: Ctrl+B d
-              * Send ClientMessage::Detach
-              * Wait for ServerMessage::Detached
-              * Print "detached (from session &lt;name&gt;)" and exit terminal loop cleanly
-
-           b) Workspace prefix commands:
-              * Ctrl+B c → send CreateWorkspace, on WorkspaceCreated switch locally
-              * Ctrl+B n → switch to next workspace (wrapping)
-              * Ctrl+B p → switch to previous workspace
-              * Ctrl+B 0-9 → switch to workspace by index
-              * Ctrl+B &amp; → close current workspace (or Ctrl+B shift+x)
-
-           c) Handle new ServerMessage variants:
-              * WorkspaceCreated → create workspace in PaneManager
-              * WorkspaceClosed → remove workspace in PaneManager
-              * WorkspaceSwitched → switch active workspace
-              * SessionState → rebuild PaneManager (on initial attach)
-              * Detached → exit terminal loop
-
-           d) Status bar integration:
-              * After each render, draw status bar at terminal bottom
-              * Layout gets terminal_rows - 1 for pane area
-
-        4. Update cmux-client/src/main.rs:
-
-           - attach command: connect, send Attach, wait for SessionState, rebuild PaneManager, enter terminal loop
-           - new command: connect, send CreateSession, wait for SessionCreated + SessionState, enter terminal loop
+        3. Add unit test for pane_at_position in pane_manager.rs
       </action>
 
       <verification>
@@ -226,66 +202,19 @@
         <command>cargo fmt --all --check</command>
         <command>cargo test --workspace</command>
         <manual>
-          1. Start daemon, create session: cmux-client new -s main
-          2. Press Ctrl+B d → detaches, prints message, exits
-          3. Run cmux-client attach -t main → reattaches, sees same panes
-          4. Press Ctrl+B c → new workspace (tab)
-          5. Press Ctrl+B n/p → switch between workspaces
-          6. Status bar at bottom shows session name and workspace list
-          7. Press Ctrl+B 0 → switch to workspace 0
-          8. Start second client attached to same session → both work
+          1. Start daemon + client
+          2. Split panes (Ctrl+B %)
+          3. Click on inactive pane with mouse → it becomes active (border changes)
+          4. Mouse wheel scrolls (sends arrow keys for now)
         </manual>
       </verification>
 
       <done>
-        - Ctrl+B d detaches cleanly, daemon keeps panes alive
-        - cmux attach -t &lt;name&gt; reattaches and restores UI state
-        - Workspaces: create (Ctrl+B c), next/prev (n/p), select (0-9)
-        - Status bar shows session name and workspace tabs
-        - Layout area correctly sized (terminal_rows - 1 for status bar)
-        - Multiple clients can attach to same session
+        - Mouse click selects pane (active pane changes, borders update)
+        - Mouse capture enabled/disabled cleanly
+        - pane_at_position correctly maps coordinates to panes
+        - Mouse wheel sends scroll input
         - All tests pass
-      </done>
-    </task>
-
-    <task id="3" type="test" complete="false">
-      <name>Session lifecycle and workspace unit tests</name>
-      <description>
-        Add unit tests for workspace management, session state queries, and
-        IPC message serialization for the new message types.
-      </description>
-
-      <files>
-        <modify>
-          cmux-ipc/src/messages.rs              (tests for new message variants)
-          cmux-core/src/layout.rs               (test workspace-related layout scenarios if needed)
-        </modify>
-      </files>
-
-      <action>
-        1. IPC message tests (cmux-ipc/src/messages.rs):
-           - CreateWorkspace round-trip
-           - CloseWorkspace round-trip
-           - SwitchWorkspace round-trip
-           - SessionState with multiple workspaces round-trip
-           - WorkspaceInfo serialization
-           - Detached message round-trip
-
-        2. Session state tests:
-           - Verify SessionState contains correct workspace and pane info
-           - Verify workspace IDs are unique
-           - Verify pane IDs are globally unique across workspaces
-      </action>
-
-      <verification>
-        <command>cargo test --workspace</command>
-      </verification>
-
-      <done>
-        - All new IPC message types have serialization round-trip tests
-        - Session state structure tests pass
-        - All previous tests still pass
-        - cargo test --workspace exits 0
       </done>
     </task>
   </tasks>
@@ -298,21 +227,17 @@
       <command>cargo test --workspace</command>
     </commands>
     <manual>
-      1. Start daemon + client with new session
-      2. Detach (Ctrl+B d) — verify message printed, daemon still running
-      3. Reattach (cmux attach) — verify panes restored
-      4. Create/switch workspaces (Ctrl+B c/n/p/0-9)
-      5. Status bar shows correct workspace info
-      6. Multiple clients on same session
+      1. All existing prefix keys still work (%, ", x, z, o, d, c, n, p, 0-9, arrows)
+      2. Mouse click selects pane
+      3. Terminal still restores cleanly on exit
     </manual>
   </phase_verification>
 
   <completion_criteria>
-    <criterion>All 3 tasks marked complete</criterion>
+    <criterion>All 2 tasks marked complete</criterion>
     <criterion>cargo build/clippy/fmt/test all pass</criterion>
-    <criterion>Detach/reattach preserves session state</criterion>
-    <criterion>Workspace create/switch/close works</criterion>
-    <criterion>Status bar renders at terminal bottom</criterion>
-    <criterion>Multiple clients can attach to same session</criterion>
+    <criterion>Key dispatch through KeyTable (not hardcoded match)</criterion>
+    <criterion>Mouse click selects pane</criterion>
+    <criterion>All existing keybindings work identically</criterion>
   </completion_criteria>
 </plan>

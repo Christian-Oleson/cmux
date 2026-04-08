@@ -1,10 +1,13 @@
 use crate::pane_manager::PaneManager;
 use crate::renderer::{self, Renderer};
+use cmux_core::keybinding::{Action, InputKey, KeyCode as CmuxKeyCode, KeyTable};
 use cmux_core::layout::SplitDirection;
 use cmux_core::types::PaneId;
 use cmux_ipc::messages::{ClientMessage, ServerMessage};
 use cmux_ipc::transport;
-use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    Event, EventStream, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind,
+};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use std::io::Write;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -37,6 +40,7 @@ impl Drop for RawModeGuard {
         let _ = disable_raw_mode();
         let _ = crossterm::execute!(
             std::io::stdout(),
+            crossterm::event::DisableMouseCapture,
             crossterm::cursor::Show,
             crossterm::style::ResetColor,
             crossterm::terminal::LeaveAlternateScreen
@@ -54,6 +58,7 @@ where
     W: AsyncWrite + Unpin + Send + 'static,
 {
     let _raw_guard = RawModeGuard::enable()?;
+    crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture)?;
 
     let (cols, rows) = crossterm::terminal::size()?;
     debug!(cols, rows, "Terminal size");
@@ -65,6 +70,7 @@ where
     let mut renderer = Renderer::new();
     let mut input_mode = InputMode::Normal;
     let mut event_stream = EventStream::new();
+    let key_table = KeyTable::default_tmux();
 
     // Initial full render with status bar
     {
@@ -88,10 +94,8 @@ where
                     Some(Ok(Event::Key(key_event))) => {
                         match input_mode {
                             InputMode::Normal => {
-                                // Check for prefix key: Ctrl+B
-                                if key_event.modifiers.contains(KeyModifiers::CONTROL)
-                                    && key_event.code == KeyCode::Char('b')
-                                {
+                                // Check for prefix key
+                                if key_table.is_prefix(&to_input_key(&key_event)) {
                                     input_mode = InputMode::WaitingForPrefixCommand;
                                     continue;
                                 }
@@ -109,6 +113,7 @@ where
                                 input_mode = InputMode::Normal;
                                 let action = handle_prefix_command(
                                     &key_event,
+                                    &key_table,
                                     &mut panes,
                                     &mut renderer,
                                     &mut pipe_writer,
@@ -149,6 +154,52 @@ where
                             data: text.into_bytes(),
                         };
                         transport::write_message(&mut pipe_writer, &msg).await?;
+                    }
+                    Some(Ok(Event::Mouse(mouse_event))) => {
+                        match mouse_event.kind {
+                            MouseEventKind::Down(MouseButton::Left) => {
+                                let row = mouse_event.row;
+                                let col = mouse_event.column;
+                                if let Some(pane_id) = panes.pane_at_position(row, col) {
+                                    if pane_id != panes.active_pane() {
+                                        panes.layout_mut().set_active_pane(pane_id);
+                                        let snaps = panes.snapshots();
+                                        let (term_cols, term_rows) =
+                                            crossterm::terminal::size()?;
+                                        let mut stdout = std::io::stdout().lock();
+                                        renderer.render_full(
+                                            &snaps,
+                                            panes.layout(),
+                                            panes.active_pane(),
+                                            &mut stdout,
+                                        )?;
+                                        renderer::render_status_bar(
+                                            &mut stdout,
+                                            panes.session_name(),
+                                            &panes.workspace_list(),
+                                            term_cols,
+                                            term_rows.saturating_sub(1),
+                                        )?;
+                                        stdout.flush()?;
+                                    }
+                                }
+                            }
+                            MouseEventKind::ScrollUp => {
+                                let msg = ClientMessage::PaneInput {
+                                    pane_id: panes.active_pane().0,
+                                    data: b"\x1b[A".to_vec(),
+                                };
+                                transport::write_message(&mut pipe_writer, &msg).await?;
+                            }
+                            MouseEventKind::ScrollDown => {
+                                let msg = ClientMessage::PaneInput {
+                                    pane_id: panes.active_pane().0,
+                                    data: b"\x1b[B".to_vec(),
+                                };
+                                transport::write_message(&mut pipe_writer, &msg).await?;
+                            }
+                            _ => {}
+                        }
                     }
                     Some(Err(e)) => {
                         debug!(error = %e, "Event stream error");
@@ -308,6 +359,7 @@ where
 
 async fn handle_prefix_command<W: AsyncWrite + Unpin>(
     key: &KeyEvent,
+    key_table: &KeyTable,
     panes: &mut PaneManager,
     renderer: &mut Renderer,
     pipe_writer: &mut W,
@@ -315,12 +367,11 @@ async fn handle_prefix_command<W: AsyncWrite + Unpin>(
     terminal_rows: u16,
 ) -> anyhow::Result<PrefixAction> {
     let status_row = terminal_rows.saturating_sub(1);
+    let input_key = to_input_key(key);
 
-    match key.code {
-        // Split vertical: prefix + %
-        KeyCode::Char('%') => {
+    match key_table.resolve_prefix(&input_key) {
+        Some(Action::SplitVertical) => {
             let direction = SplitDirection::Vertical;
-            // Request daemon to create new pane PTY
             transport::write_message(
                 pipe_writer,
                 &ClientMessage::SplitPane {
@@ -328,7 +379,6 @@ async fn handle_prefix_command<W: AsyncWrite + Unpin>(
                 },
             )
             .await?;
-            // Update local layout
             panes.split(direction);
             let snaps = panes.snapshots();
             let mut stdout = std::io::stdout().lock();
@@ -343,8 +393,7 @@ async fn handle_prefix_command<W: AsyncWrite + Unpin>(
             stdout.flush()?;
         }
 
-        // Split horizontal: prefix + "
-        KeyCode::Char('"') => {
+        Some(Action::SplitHorizontal) => {
             let direction = SplitDirection::Horizontal;
             transport::write_message(
                 pipe_writer,
@@ -367,8 +416,7 @@ async fn handle_prefix_command<W: AsyncWrite + Unpin>(
             stdout.flush()?;
         }
 
-        // Close pane: prefix + x
-        KeyCode::Char('x') => {
+        Some(Action::ClosePane) => {
             let active = panes.active_pane();
             transport::write_message(pipe_writer, &ClientMessage::ClosePane { pane_id: active.0 })
                 .await?;
@@ -386,8 +434,7 @@ async fn handle_prefix_command<W: AsyncWrite + Unpin>(
             stdout.flush()?;
         }
 
-        // Zoom/unzoom: prefix + z
-        KeyCode::Char('z') => {
+        Some(Action::ToggleZoom) => {
             panes.layout_mut().toggle_zoom();
             let snaps = panes.snapshots();
             let mut stdout = std::io::stdout().lock();
@@ -402,8 +449,7 @@ async fn handle_prefix_command<W: AsyncWrite + Unpin>(
             stdout.flush()?;
         }
 
-        // Cycle pane forward: prefix + o
-        KeyCode::Char('o') => {
+        Some(Action::CyclePaneForward) => {
             panes.layout_mut().cycle_pane(true);
             let snaps = panes.snapshots();
             let mut stdout = std::io::stdout().lock();
@@ -418,8 +464,7 @@ async fn handle_prefix_command<W: AsyncWrite + Unpin>(
             stdout.flush()?;
         }
 
-        // Navigate: prefix + arrow keys
-        KeyCode::Up => {
+        Some(Action::NavigateUp) => {
             panes
                 .layout_mut()
                 .navigate(SplitDirection::Horizontal, false);
@@ -435,7 +480,8 @@ async fn handle_prefix_command<W: AsyncWrite + Unpin>(
             )?;
             stdout.flush()?;
         }
-        KeyCode::Down => {
+
+        Some(Action::NavigateDown) => {
             panes
                 .layout_mut()
                 .navigate(SplitDirection::Horizontal, true);
@@ -451,7 +497,8 @@ async fn handle_prefix_command<W: AsyncWrite + Unpin>(
             )?;
             stdout.flush()?;
         }
-        KeyCode::Left => {
+
+        Some(Action::NavigateLeft) => {
             panes.layout_mut().navigate(SplitDirection::Vertical, false);
             let snaps = panes.snapshots();
             let mut stdout = std::io::stdout().lock();
@@ -465,7 +512,8 @@ async fn handle_prefix_command<W: AsyncWrite + Unpin>(
             )?;
             stdout.flush()?;
         }
-        KeyCode::Right => {
+
+        Some(Action::NavigateRight) => {
             panes.layout_mut().navigate(SplitDirection::Vertical, true);
             let snaps = panes.snapshots();
             let mut stdout = std::io::stdout().lock();
@@ -480,23 +528,16 @@ async fn handle_prefix_command<W: AsyncWrite + Unpin>(
             stdout.flush()?;
         }
 
-        // Detach: prefix + d
-        KeyCode::Char('d') => {
+        Some(Action::Detach) => {
             transport::write_message(pipe_writer, &ClientMessage::Detach).await?;
-            // The main loop will break when it receives ServerMessage::Detached,
-            // but we also return a PrefixAction to break immediately if the
-            // server never responds.
             return Ok(PrefixAction::Detach);
         }
 
-        // Create workspace: prefix + c
-        KeyCode::Char('c') => {
+        Some(Action::CreateWorkspace) => {
             transport::write_message(pipe_writer, &ClientMessage::CreateWorkspace).await?;
-            // The workspace will be created when we receive WorkspaceCreated from the daemon
         }
 
-        // Next workspace: prefix + n
-        KeyCode::Char('n') => {
+        Some(Action::NextWorkspace) => {
             let ids = panes.workspace_ids_sorted();
             if ids.len() > 1 {
                 let current = panes.active_workspace_id();
@@ -512,8 +553,7 @@ async fn handle_prefix_command<W: AsyncWrite + Unpin>(
             }
         }
 
-        // Previous workspace: prefix + p
-        KeyCode::Char('p') => {
+        Some(Action::PrevWorkspace) => {
             let ids = panes.workspace_ids_sorted();
             if ids.len() > 1 {
                 let current = panes.active_workspace_id();
@@ -529,9 +569,8 @@ async fn handle_prefix_command<W: AsyncWrite + Unpin>(
             }
         }
 
-        // Select workspace by index: prefix + 0-9
-        KeyCode::Char(c @ '0'..='9') => {
-            let idx = c as usize - '0' as usize;
+        Some(Action::SelectWorkspace(idx)) => {
+            let idx = *idx as usize;
             let ids = panes.workspace_ids_sorted();
             if idx < ids.len() {
                 let ws_id = ids[idx];
@@ -545,11 +584,52 @@ async fn handle_prefix_command<W: AsyncWrite + Unpin>(
             }
         }
 
-        // Unknown prefix command -- ignore
-        _ => {}
+        Some(Action::SendPrefix) => {
+            // Double-press prefix: send prefix key bytes to the active pane.
+            // For Ctrl+B that is the byte 0x02.
+            let msg = ClientMessage::PaneInput {
+                pane_id: panes.active_pane().0,
+                data: vec![0x02],
+            };
+            transport::write_message(pipe_writer, &msg).await?;
+        }
+
+        None => {
+            // Unknown prefix command -- ignore
+        }
     }
 
     Ok(PrefixAction::None)
+}
+
+/// Convert a crossterm [`KeyEvent`] into a crossterm-independent [`InputKey`].
+fn to_input_key(event: &KeyEvent) -> InputKey {
+    let code = match event.code {
+        KeyCode::Char(c) => CmuxKeyCode::Char(c),
+        KeyCode::Enter => CmuxKeyCode::Enter,
+        KeyCode::Backspace => CmuxKeyCode::Backspace,
+        KeyCode::Tab => CmuxKeyCode::Tab,
+        KeyCode::Esc => CmuxKeyCode::Esc,
+        KeyCode::Up => CmuxKeyCode::Up,
+        KeyCode::Down => CmuxKeyCode::Down,
+        KeyCode::Left => CmuxKeyCode::Left,
+        KeyCode::Right => CmuxKeyCode::Right,
+        KeyCode::Home => CmuxKeyCode::Home,
+        KeyCode::End => CmuxKeyCode::End,
+        KeyCode::PageUp => CmuxKeyCode::PageUp,
+        KeyCode::PageDown => CmuxKeyCode::PageDown,
+        KeyCode::Delete => CmuxKeyCode::Delete,
+        KeyCode::Insert => CmuxKeyCode::Insert,
+        KeyCode::F(n) => CmuxKeyCode::F(n),
+        // Unmapped keys get a null char placeholder
+        _ => CmuxKeyCode::Char('\0'),
+    };
+    InputKey {
+        code,
+        ctrl: event.modifiers.contains(KeyModifiers::CONTROL),
+        alt: event.modifiers.contains(KeyModifiers::ALT),
+        shift: event.modifiers.contains(KeyModifiers::SHIFT),
+    }
 }
 
 fn key_event_to_bytes(event: &KeyEvent) -> Option<Vec<u8>> {

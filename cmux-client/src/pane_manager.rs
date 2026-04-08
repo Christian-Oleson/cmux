@@ -103,6 +103,21 @@ impl PaneManager {
         }
     }
 
+    /// Find the pane at the given terminal (row, col) position, if any.
+    pub fn pane_at_position(&self, row: u16, col: u16) -> Option<PaneId> {
+        let rects = self.layout().pane_rects();
+        for rect in &rects {
+            if row >= rect.row
+                && row < rect.row + rect.height
+                && col >= rect.col
+                && col < rect.col + rect.width
+            {
+                return Some(rect.pane_id);
+            }
+        }
+        None
+    }
+
     pub fn layout(&self) -> &LayoutEngine {
         &self.active_ws().layout
     }
@@ -421,5 +436,62 @@ mod tests {
     fn session_name_stored() {
         let pm = PaneManager::new_with_session("my-session".into(), 24, 80);
         assert_eq!(pm.session_name(), "my-session");
+    }
+
+    #[test]
+    fn pane_at_position_single_pane() {
+        let pm = PaneManager::new(24, 80);
+        // Top-left corner
+        assert_eq!(pm.pane_at_position(0, 0), Some(PaneId(0)));
+        // Bottom-right corner (just inside)
+        assert_eq!(pm.pane_at_position(23, 79), Some(PaneId(0)));
+        // Outside bounds
+        assert_eq!(pm.pane_at_position(24, 0), None);
+        assert_eq!(pm.pane_at_position(0, 80), None);
+    }
+
+    #[test]
+    fn pane_at_position_vertical_split() {
+        let mut pm = PaneManager::new(24, 80);
+        let new_pane = pm.split(SplitDirection::Vertical);
+
+        let rects = pm.layout().pane_rects();
+        let left = &rects[0];
+        let right = &rects[1];
+
+        // Click inside left pane
+        assert_eq!(pm.pane_at_position(0, 0), Some(PaneId(0)));
+        assert_eq!(pm.pane_at_position(12, left.width / 2), Some(PaneId(0)));
+
+        // Click inside right pane
+        assert_eq!(pm.pane_at_position(0, right.col), Some(new_pane));
+        assert_eq!(
+            pm.pane_at_position(12, right.col + right.width / 2),
+            Some(new_pane)
+        );
+
+        // Click on border (between panes) should return None
+        let border_col = left.width; // the border column
+        assert_eq!(pm.pane_at_position(0, border_col), None);
+    }
+
+    #[test]
+    fn pane_at_position_horizontal_split() {
+        let mut pm = PaneManager::new(24, 80);
+        let new_pane = pm.split(SplitDirection::Horizontal);
+
+        let rects = pm.layout().pane_rects();
+        let top = &rects[0];
+        let bottom = &rects[1];
+
+        // Click inside top pane
+        assert_eq!(pm.pane_at_position(0, 40), Some(PaneId(0)));
+
+        // Click inside bottom pane
+        assert_eq!(pm.pane_at_position(bottom.row, 40), Some(new_pane));
+
+        // Click on border row should return None
+        let border_row = top.height;
+        assert_eq!(pm.pane_at_position(border_row, 40), None);
     }
 }
