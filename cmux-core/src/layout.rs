@@ -47,12 +47,17 @@ pub struct LayoutEngine {
 impl LayoutEngine {
     /// Create a new layout engine with a single pane filling the terminal.
     pub fn new(rows: u16, cols: u16) -> Self {
+        Self::new_with_pane_id(rows, cols, PaneId(0))
+    }
+
+    /// Create a new layout engine with a single pane using the given pane id.
+    pub fn new_with_pane_id(rows: u16, cols: u16, pane_id: PaneId) -> Self {
         Self {
-            root: LayoutNode::Leaf { pane_id: PaneId(0) },
+            root: LayoutNode::Leaf { pane_id },
             terminal_rows: rows,
             terminal_cols: cols,
-            next_pane_id: 1,
-            active_pane: PaneId(0),
+            next_pane_id: pane_id.0 + 1,
+            active_pane: pane_id,
             zoomed_pane: None,
         }
     }

@@ -8,6 +8,58 @@ use crossterm::QueueableCommand;
 use std::collections::HashMap;
 use std::io::Write;
 
+/// Render the status bar at the given row.
+///
+/// Format: inverse colors, `[session] 0:name | 1:name* | 2:name`
+/// The active workspace is marked with `*`.
+pub fn render_status_bar<W: Write>(
+    out: &mut W,
+    session_name: &str,
+    workspaces: &[(u32, String, bool)],
+    terminal_cols: u16,
+    row: u16,
+) -> std::io::Result<()> {
+    // Build the status text
+    let mut text = format!("[{}] ", session_name);
+    for (i, (id, name, is_active)) in workspaces.iter().enumerate() {
+        if i > 0 {
+            text.push_str(" | ");
+        }
+        if *is_active {
+            text.push_str(&format!("{}:{}*", id, name));
+        } else {
+            text.push_str(&format!("{}:{}", id, name));
+        }
+    }
+
+    // Pad or truncate to fill the terminal width
+    let cols = terminal_cols as usize;
+    if text.len() < cols {
+        text.push_str(&" ".repeat(cols - text.len()));
+    } else if text.len() > cols {
+        text.truncate(cols);
+    }
+
+    // Render with inverse attribute
+    out.queue(cursor::MoveTo(0, row))?;
+    let bar_style = ContentStyle {
+        attributes: {
+            let mut a = Attributes::default();
+            a.set(Attribute::Reverse);
+            a
+        },
+        ..ContentStyle::default()
+    };
+    out.queue(style::PrintStyledContent(StyledContent::new(
+        bar_style, &text,
+    )))?;
+
+    // Reset attributes after the bar
+    out.queue(style::ResetColor)?;
+
+    Ok(())
+}
+
 fn to_crossterm_color(color: Color) -> style::Color {
     match color {
         Color::Default => style::Color::Reset,

@@ -1,334 +1,53 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- Dos Apes Super Agent Framework - Phase Plan -->
 <!-- Generated: 2026-04-07 -->
-<!-- Phase: 3 -->
+<!-- Phase: 4 -->
 
 <plan>
   <metadata>
-    <phase>3</phase>
-    <name>Layout Engine &amp; Pane Management</name>
-    <goal>Split, resize, navigate, and zoom panes using a tree-based layout engine with Unicode borders</goal>
-    <deliverable>Multi-pane terminal with horizontal/vertical splits, directional navigation, resize, zoom, close, and pane borders</deliverable>
+    <phase>4</phase>
+    <name>Sessions &amp; Workspaces</name>
+    <goal>Support multiple named sessions with detach/reattach, tabbed workspaces, and a status bar</goal>
+    <deliverable>Users can create sessions, detach (Ctrl+B d), reattach, switch workspaces (tabs), and see session info in a status bar</deliverable>
     <created>2026-04-07</created>
   </metadata>
 
   <context>
-    <dependencies>Phase 2 complete — ScreenBuffer (vt100), Renderer (crossterm differential), daemon/client IPC</dependencies>
+    <dependencies>Phase 3 complete — layout engine, multi-pane, prefix keys, daemon multi-pane IPC</dependencies>
     <affected_areas>
-      - cmux-core: new layout module (tree engine), IPC message additions
-      - cmux-client: multi-pane renderer, prefix key input handler, pane management
-      - cmux-daemon: multi-pane session manager, split/close/navigate commands
-      - cmux-ipc: new message variants for pane operations
+      - cmux-core/src/types.rs: Already has Session/Workspace/WorkspaceId types (unused) — wire them in
+      - cmux-daemon/src/session_manager.rs: Refactor to nest workspaces in sessions
+      - cmux-daemon/src/server.rs: Handle workspace messages, session state query
+      - cmux-ipc/src/messages.rs: New workspace + session state messages
+      - cmux-client/src/terminal.rs: Detach, workspace prefix keys, status bar
+      - cmux-client/src/pane_manager.rs: Workspace-aware pane management
+      - cmux-client/src/renderer.rs: Status bar rendering
     </affected_areas>
     <patterns_to_follow>
-      - Binary split tree: each internal node is a Split(Horizontal|Vertical), each leaf is a Pane
-      - Layout allocation: parent gives each child a proportional share of its area, accounting for 1-char border
-      - Renderer offset: emit_cell(layout.start_row + pane_row, layout.start_col + pane_col, cell)
-      - IPC already has pane_id on PaneOutput/PaneInput — extend with SplitPane, ClosePane, etc.
-      - Prefix key (Ctrl+B) triggers multiplexer commands — basic implementation here, full keybinding system in Phase 5
+      - Daemon is source of truth for session/workspace/pane state
+      - On attach, daemon sends full state snapshot, client rebuilds UI
+      - Ctrl+B d = detach (daemon keeps everything alive)
+      - Ctrl+B c = new workspace, Ctrl+B n/p = next/prev workspace, Ctrl+B 0-9 = select by index
+      - Status bar at terminal bottom (1 row reserved from layout)
+      - Workspace = independent pane layout tree with its own set of panes
     </patterns_to_follow>
   </context>
 
   <tasks>
     <task id="1" type="backend" complete="false">
-      <name>Tree-based layout engine with unit tests</name>
+      <name>Daemon workspace model, session state query, and detach/reattach</name>
       <description>
-        Implement a binary split tree layout engine in cmux-core that manages pane
-        positions and dimensions. Supports horizontal/vertical splits, pane removal,
-        terminal resize, directional navigation, zoom, and predefined layouts.
-        Includes comprehensive unit tests.
-      </description>
-
-      <files>
-        <create>
-          cmux-core/src/layout.rs              (layout tree engine)
-        </create>
-        <modify>
-          cmux-core/src/lib.rs                 (add pub mod layout)
-        </modify>
-      </files>
-
-      <action>
-        1. Create cmux-core/src/layout.rs with the following types:
-
-           a) SplitDirection enum: Horizontal, Vertical
-
-           b) LayoutNode enum (the tree):
-              - Leaf { pane_id: PaneId }
-              - Split { direction: SplitDirection, ratio: f32, first: Box&lt;LayoutNode&gt;, second: Box&lt;LayoutNode&gt; }
-              
-              ratio is 0.0-1.0 representing how much space the first child gets.
-              Default 0.5 for even splits.
-
-           c) PaneRect struct:
-              - pane_id: PaneId
-              - row: u16, col: u16 (top-left corner in terminal coords)
-              - height: u16, width: u16
-
-           d) LayoutEngine struct:
-              - root: LayoutNode
-              - terminal_rows: u16, terminal_cols: u16
-              - next_pane_id: u32
-              - active_pane: PaneId
-              - zoomed_pane: Option&lt;PaneId&gt;
-
-        2. LayoutEngine methods:
-
-           - pub fn new(rows: u16, cols: u16) -> Self
-             * Creates root as Leaf with PaneId(0), active_pane = PaneId(0)
-
-           - pub fn pane_rects(&amp;self) -> Vec&lt;PaneRect&gt;
-             * Recursively traverse the tree starting with the full terminal area
-             * If zoomed_pane is Some, return only that pane at full terminal size
-             * For Split nodes: divide area (minus 1 for border) by ratio, recurse
-             * Horizontal split: top/bottom (border is a horizontal line between them)
-             * Vertical split: left/right (border is a vertical line between them)
-
-           - pub fn split(&amp;mut self, direction: SplitDirection) -> PaneId
-             * Find the leaf matching active_pane in the tree
-             * Replace it with Split { direction, ratio: 0.5, first: old_leaf, second: new_leaf }
-             * Assign new PaneId to the new leaf
-             * Set active_pane to the new pane
-             * Return the new PaneId
-
-           - pub fn close_pane(&amp;mut self, pane_id: PaneId) -> bool
-             * Find the Split node that contains the pane_id as a child
-             * Replace the Split with the OTHER child (the sibling)
-             * If active_pane was the closed pane, set it to remaining sibling's first leaf
-             * Return false if pane_id is the last pane (can't close)
-
-           - pub fn navigate(&amp;mut self, direction: SplitDirection, forward: bool)
-             * Find the active pane in the tree
-             * Navigate to the adjacent pane in the given direction
-             * For Vertical + forward: go right. For Vertical + !forward: go left.
-             * For Horizontal + forward: go down. For Horizontal + !forward: go up.
-             * Set active_pane to the target pane
-
-           - pub fn cycle_pane(&amp;mut self, forward: bool)
-             * Get all pane_ids in tree order (left-to-right DFS)
-             * Find active_pane index, move to next/prev (wrapping)
-
-           - pub fn resize_pane(&amp;mut self, direction: SplitDirection, amount: i16)
-             * Find the nearest Split ancestor of active_pane with matching direction
-             * Adjust its ratio by amount/terminal_dimension
-             * Clamp ratio to 0.1..0.9
-
-           - pub fn toggle_zoom(&amp;mut self)
-             * If zoomed_pane is None, set it to active_pane
-             * If zoomed_pane is Some, clear it
-
-           - pub fn resize_terminal(&amp;mut self, rows: u16, cols: u16)
-             * Update terminal_rows and terminal_cols
-             * pane_rects() will automatically recompute from new dimensions
-
-           - pub fn pane_ids(&amp;self) -> Vec&lt;PaneId&gt;
-             * Return all pane IDs in tree order
-
-           - pub fn active_pane(&amp;self) -> PaneId
-
-           - pub fn set_active_pane(&amp;mut self, pane_id: PaneId)
-
-           - pub fn border_cells(&amp;self) -> Vec&lt;(u16, u16, char)&gt;
-             * Compute all border character positions
-             * Use Unicode box-drawing: '│' (vertical), '─' (horizontal), '┼' (cross),
-               '┬' (top-T), '┴' (bottom-T), '├' (left-T), '┤' (right-T)
-             * Return Vec of (row, col, char) for the renderer to draw
-
-        3. Unit tests (inline #[cfg(test)] mod tests):
-           - new() creates single pane at (0, 0) filling terminal
-           - split vertical creates two panes side by side with border
-           - split horizontal creates two panes top/bottom with border
-           - nested splits (split, then split again) produce correct rects
-           - close_pane removes pane, sibling expands
-           - close last pane returns false
-           - cycle_pane wraps around
-           - resize_pane adjusts ratio
-           - toggle_zoom returns single full-screen pane
-           - resize_terminal updates all pane rects
-           - border_cells returns correct positions
-           - pane dimensions account for border (total - 1 for each split level)
-
-        4. Add pub mod layout to cmux-core/src/lib.rs
-      </action>
-
-      <verification>
-        <command>cargo build -p cmux-core</command>
-        <command>cargo test -p cmux-core</command>
-        <command>cargo clippy -p cmux-core</command>
-      </verification>
-
-      <done>
-        - LayoutEngine creates, splits, closes, navigates, resizes, zooms panes
-        - pane_rects() returns correct pixel-perfect positions for all panes
-        - border_cells() returns Unicode box-drawing characters at correct positions
-        - All existing tests still pass
-        - 12+ new layout unit tests pass
-      </done>
-    </task>
-
-    <task id="2" type="backend" complete="false">
-      <name>Multi-pane renderer with borders and pane offset rendering</name>
-      <description>
-        Update the renderer to draw multiple pane screen buffers at their layout
-        positions, draw pane borders with Unicode box-drawing characters, and
-        highlight the active pane border. Update the client terminal loop to
-        manage multiple ScreenBuffers and route output by pane_id.
-      </description>
-
-      <files>
-        <create>
-          cmux-client/src/pane_manager.rs       (manages per-pane screen buffers + layout)
-        </create>
-        <modify>
-          cmux-client/src/renderer.rs           (multi-pane render_full/render_diff + border drawing)
-          cmux-client/src/terminal.rs           (use PaneManager, route output by pane_id)
-        </modify>
-      </files>
-
-      <action>
-        1. Create cmux-client/src/pane_manager.rs:
-
-           - PaneManager struct:
-             * layout: LayoutEngine
-             * screens: HashMap&lt;PaneId, ScreenBuffer&gt;
-           
-           - pub fn new(rows: u16, cols: u16) -> Self
-             * Creates LayoutEngine, initial ScreenBuffer for pane 0
-
-           - pub fn process_output(&amp;mut self, pane_id: PaneId, data: &amp;[u8])
-             * Find ScreenBuffer for pane_id, call process()
-
-           - pub fn split(&amp;mut self, direction: SplitDirection) -> PaneId
-             * Call layout.split(direction)
-             * Get new pane rect from layout
-             * Create new ScreenBuffer with pane's dimensions
-             * Resize existing panes to match new layout rects
-             * Return new PaneId
-
-           - pub fn close_pane(&amp;mut self, pane_id: PaneId) -> bool
-             * Call layout.close_pane()
-             * Remove ScreenBuffer for pane_id
-             * Resize remaining panes to match new layout
-             * Return success
-
-           - pub fn resize_terminal(&amp;mut self, rows: u16, cols: u16)
-             * layout.resize_terminal(rows, cols)
-             * Resize all ScreenBuffers to match new rects
-
-           - Delegate: navigate, cycle_pane, resize_pane, toggle_zoom, active_pane, etc.
-
-           - pub fn layout(&amp;self) -> &amp;LayoutEngine
-
-           - pub fn snapshots(&amp;self) -> HashMap&lt;PaneId, ScreenSnapshot&gt;
-             * Snapshot each screen buffer
-
-        2. Update cmux-client/src/renderer.rs:
-
-           a) Change render_full signature:
-              ```
-              pub fn render_full_composite(
-                  &amp;mut self,
-                  snapshots: &amp;HashMap&lt;PaneId, ScreenSnapshot&gt;,
-                  layout: &amp;LayoutEngine,
-                  active_pane: PaneId,
-                  out: &amp;mut W,
-              )
-              ```
-              * Clear screen
-              * For each pane rect in layout:
-                - Get snapshot for pane_id
-                - For each cell: emit at (rect.row + cell_row, rect.col + cell_col)
-              * Draw borders from layout.border_cells()
-              * Highlight active pane border (use brighter color or bold)
-              * Position cursor at active pane's cursor position + offset
-              * Show/hide cursor based on active pane
-
-           b) Change render_diff to render_diff_composite with same signature pattern:
-              * Compare per-pane snapshots against previous
-              * Only redraw cells that changed, with pane offset
-              * Redraw borders if layout changed
-              * Update cursor position for active pane
-
-           c) Border rendering helper:
-              - fn draw_borders(out, layout, active_pane)
-              - Active pane border in green/highlight, others in default/gray
-              - Use box-drawing characters from layout.border_cells()
-
-           d) Keep the old render_full/render_diff for backward compatibility (or remove if unused)
-
-        3. Update cmux-client/src/terminal.rs:
-
-           a) Replace single ScreenBuffer + Renderer with PaneManager:
-              ```
-              let mut panes = PaneManager::new(rows, cols);
-              let mut renderer = Renderer::new();
-              ```
-
-           b) Route PaneOutput by pane_id:
-              ```
-              Ok(Some(ServerMessage::PaneOutput { pane_id, data })) => {
-                  panes.process_output(PaneId(pane_id), &amp;data);
-                  let snapshots = panes.snapshots();
-                  renderer.render_diff_composite(
-                      &amp;snapshots, panes.layout(), panes.layout().active_pane(), &amp;mut stdout
-                  )?;
-              }
-              ```
-
-           c) Route input to active pane:
-              ```
-              let msg = ClientMessage::PaneInput {
-                  pane_id: panes.layout().active_pane().0,
-                  data: bytes,
-              };
-              ```
-
-           d) Handle resize:
-              ```
-              Some(Ok(Event::Resize(new_cols, new_rows))) => {
-                  panes.resize_terminal(new_rows, new_cols);
-                  renderer.render_full_composite(...)?;
-              }
-              ```
-
-        4. Add `mod pane_manager;` to cmux-client/src/main.rs
-      </action>
-
-      <verification>
-        <command>cargo build --workspace</command>
-        <command>cargo clippy --workspace</command>
-        <command>cargo fmt --all --check</command>
-        <command>cargo test --workspace</command>
-      </verification>
-
-      <done>
-        - Renderer draws multiple panes at correct layout positions
-        - Pane borders drawn with Unicode box-drawing characters
-        - Active pane border highlighted
-        - Cursor positioned correctly within active pane
-        - Terminal resize redistributes pane dimensions
-        - PaneOutput routed to correct pane by pane_id
-        - Input routed to active pane
-        - All tests pass
-      </done>
-    </task>
-
-    <task id="3" type="integration" complete="false">
-      <name>Daemon multi-pane support + IPC commands + basic prefix key</name>
-      <description>
-        Extend the daemon to manage multiple panes per session, add IPC messages
-        for split/close/navigate/resize/zoom, and implement a basic Ctrl+B prefix
-        key in the client to trigger these operations. This makes multi-pane
-        interactive from the user's perspective.
+        Refactor the daemon to support workspaces (tabs) within sessions. Each workspace
+        has its own set of panes with independent ConPTY processes. Add a session state
+        query so clients can rebuild their UI on reattach. Implement clean detach
+        (daemon keeps panes alive) and reattach (daemon sends current state).
       </description>
 
       <files>
         <modify>
-          cmux-ipc/src/messages.rs              (add SplitPane, ClosePane, Navigate, ResizePane, Zoom, PaneCreated, PaneClosed)
-          cmux-daemon/src/session_manager.rs    (multi-pane: split creates new ConPTY, close kills PTY, per-pane output routing)
-          cmux-daemon/src/server.rs             (handle new message types)
-          cmux-client/src/terminal.rs           (prefix key handler: Ctrl+B then ", %, arrow, x, z, o)
-          cmux-client/src/pane_manager.rs       (handle PaneCreated/PaneClosed from daemon)
+          cmux-ipc/src/messages.rs              (add workspace + session state messages)
+          cmux-daemon/src/session_manager.rs    (workspace model, state query, per-workspace pane tracking)
+          cmux-daemon/src/server.rs             (handle new messages, state query on attach)
         </modify>
       </files>
 
@@ -336,85 +55,169 @@
         1. Add new IPC messages to cmux-ipc/src/messages.rs:
 
            ClientMessage additions:
-           - SplitPane { direction: String }  ("horizontal" or "vertical")
-           - ClosePane { pane_id: u32 }
-           - NavigatePane { direction: String }  ("up", "down", "left", "right")
-           - CyclePane { forward: bool }
-           - ResizePane { direction: String, amount: i16 }
-           - ToggleZoom
+           - CreateWorkspace
+           - CloseWorkspace { workspace_id: u32 }
+           - SwitchWorkspace { workspace_id: u32 }
+           - GetSessionState
 
            ServerMessage additions:
-           - PaneCreated { pane_id: u32, cols: u16, rows: u16 }
-           - PaneClosed { pane_id: u32 }
-           - LayoutChanged { panes: Vec&lt;PaneLayoutInfo&gt; }
+           - WorkspaceCreated { workspace_id: u32, name: String }
+           - WorkspaceClosed { workspace_id: u32 }
+           - WorkspaceSwitched { workspace_id: u32 }
+           - SessionState { session_name: String, workspaces: Vec&lt;WorkspaceInfo&gt;, active_workspace: u32 }
+           - Detached
 
-           PaneLayoutInfo struct:
-           - pane_id: u32, row: u16, col: u16, height: u16, width: u16
+           New struct WorkspaceInfo:
+           - id: u32
+           - name: String
+           - pane_ids: Vec&lt;u32&gt;
 
-        2. Update cmux-daemon/src/session_manager.rs:
+        2. Refactor cmux-daemon/src/session_manager.rs:
 
-           - Change ManagedSession to hold multiple panes:
-             * panes: HashMap&lt;u32, Arc&lt;ConPty&gt;&gt;
-             * next_pane_id: u32
+           - Add ManagedWorkspace struct:
+             * id: u32
+             * name: String
+             * panes: HashMap&lt;u32, ManagedPane&gt;
 
-           - pub async fn split_pane(&amp;self, session: &amp;str, direction: &amp;str) -> Result&lt;(u32, u16, u16)&gt;
-             * Spawn new ConPTY with pane dimensions (from layout)
-             * Start output reader task for new pane
-             * Return (new_pane_id, cols, rows)
+           - Modify ManagedSession to contain workspaces:
+             * workspaces: HashMap&lt;u32, ManagedWorkspace&gt;
+             * active_workspace: u32
+             * next_workspace_id: u32
+             * next_pane_id: u32 (global across all workspaces)
 
-           - pub async fn close_pane(&amp;self, session: &amp;str, pane_id: u32) -> Result&lt;()&gt;
-             * Kill the ConPTY for that pane
-             * Remove from panes map
+           - create_session: create initial workspace 0 with initial pane 0
 
-           - pub async fn send_input(&amp;self, session: &amp;str, pane_id: u32, data: &amp;[u8])
-             * Route input to specific pane's ConPTY (not session-level)
+           - split_pane(session, cols, rows): split in active workspace
+
+           - close_pane(session, pane_id): close in appropriate workspace
+
+           - send_input(session, pane_id, data): route to correct pane across workspaces
+
+           - create_workspace(session) -> (workspace_id, pane_id):
+             * Create new workspace with a fresh shell pane
+             * Set as active workspace
+             * Return workspace_id and initial pane_id
+
+           - close_workspace(session, workspace_id):
+             * Kill all panes in workspace
+             * Remove workspace
+             * If active workspace was closed, switch to another
+
+           - switch_workspace(session, workspace_id):
+             * Set active_workspace
+             * Return workspace_id
+
+           - get_session_state(session) -> SessionState:
+             * Return all workspace IDs, names, pane IDs, active workspace
 
         3. Update cmux-daemon/src/server.rs:
-           - Handle SplitPane: call session_manager.split_pane(), respond with PaneCreated
-           - Handle ClosePane: call session_manager.close_pane(), respond with PaneClosed
-           - Handle NavigatePane/CyclePane/ResizePane/ToggleZoom: respond with Ok
-             (these are client-local layout operations — daemon doesn't need to know the layout,
-              but does need to know which pane gets input)
 
-        4. Update cmux-client/src/terminal.rs with prefix key handler:
+           - Handle CreateWorkspace: call session_manager.create_workspace(), respond with WorkspaceCreated + PaneCreated
+           - Handle CloseWorkspace: call close_workspace(), respond with WorkspaceClosed
+           - Handle SwitchWorkspace: call switch_workspace(), respond with WorkspaceSwitched
+           - Handle GetSessionState: call get_session_state(), respond with SessionState
+           - Handle Detach: abort output task, clear attached_session, respond with Detached
+           - On Attach: auto-send SessionState so client can rebuild UI
+      </action>
 
-           Add PrefixState enum: Normal, WaitingForCommand
+      <verification>
+        <command>cargo build --workspace</command>
+        <command>cargo clippy --workspace</command>
+        <command>cargo test --workspace</command>
+      </verification>
 
-           In the key event handler:
-           ```
-           match prefix_state {
-               PrefixState::Normal => {
-                   if ctrl &amp;&amp; key == 'b' {
-                       prefix_state = PrefixState::WaitingForCommand;
-                       continue; // don't forward to PTY
-                   }
-                   // Forward to active pane as before
-               }
-               PrefixState::WaitingForCommand => {
-                   prefix_state = PrefixState::Normal;
-                   match key {
-                       '"' => send SplitPane { direction: "horizontal" }
-                       '%' => send SplitPane { direction: "vertical" }
-                       'x' => send ClosePane { pane_id: active }
-                       'z' => send ToggleZoom, panes.layout_mut().toggle_zoom(), re-render
-                       'o' => panes.layout_mut().cycle_pane(true), re-render
-                       Arrow keys => panes.layout_mut().navigate(...), re-render
-                       _ => {} // unknown prefix command, ignore
-                   }
-               }
-           }
-           ```
+      <done>
+        - Daemon supports multiple workspaces per session
+        - Workspace create/close/switch operations work
+        - Session state query returns full workspace + pane information
+        - Detach cleanly disconnects client while daemon keeps panes alive
+        - Attach sends session state for client rebuilding
+        - All existing tests pass
+      </done>
+    </task>
 
-           When PaneCreated received from daemon:
-           - Call panes.split(direction) to create local ScreenBuffer + update layout
-           - Full re-render
+    <task id="2" type="integration" complete="false">
+      <name>Client workspace UI, detach, reattach, and status bar</name>
+      <description>
+        Implement the client-side workspace management: Ctrl+B d to detach, reattach
+        that rebuilds UI from daemon state, workspace prefix keys (Ctrl+B c/n/p/0-9),
+        and a status bar at the bottom showing session name and workspace list.
+      </description>
 
-           When PaneClosed received:
-           - Call panes.close_pane(pane_id)
-           - Full re-render
+      <files>
+        <modify>
+          cmux-client/src/terminal.rs           (detach, workspace prefix keys, status bar area)
+          cmux-client/src/pane_manager.rs        (workspace switching, rebuild from state)
+          cmux-client/src/renderer.rs            (status bar rendering, reserve bottom row)
+          cmux-client/src/main.rs                (attach flow: query state, rebuild)
+        </modify>
+      </files>
 
-        5. Update PaneInput routing:
-           - Use active pane from PaneManager instead of hardcoded 0
+      <action>
+        1. Update cmux-client/src/pane_manager.rs:
+
+           - Add workspace tracking:
+             * workspaces: HashMap&lt;u32, LayoutEngine&gt; + HashMap&lt;u32, HashMap&lt;PaneId, ScreenBuffer&gt;&gt;
+             * active_workspace: u32
+             * workspace_names: HashMap&lt;u32, String&gt;
+
+           - new() creates workspace 0 with initial pane
+
+           - switch_workspace(workspace_id): swap active LayoutEngine + screens
+
+           - create_workspace(workspace_id, pane_id, name): create new LayoutEngine + initial screen
+
+           - close_workspace(workspace_id): remove workspace data
+
+           - rebuild_from_state(session_state: SessionState): rebuild all workspaces from daemon state
+             * Used on reattach
+
+           - Existing split/close/process_output/snapshots work on active workspace
+
+           - workspace_list() -> Vec&lt;(u32, String, bool)&gt;: return (id, name, is_active) for status bar
+
+        2. Update cmux-client/src/renderer.rs:
+
+           - Add status bar rendering:
+             * Reserve 1 row at bottom of terminal for status bar
+             * Status bar format: " [session] 0:workspace0 | 1:workspace1* | 2:workspace2 "
+             * Active workspace marked with * and highlighted
+             * Status bar has inverse video (bg: white/grey, fg: black)
+
+           - fn render_status_bar(out, session_name, workspaces: &amp;[(u32, String, bool)], terminal_cols, terminal_row)
+             * Draw inverse-colored bar at the specified row
+
+           - Adjust render_full/render_diff to pass status bar info
+
+        3. Update cmux-client/src/terminal.rs:
+
+           a) Detach: Ctrl+B d
+              * Send ClientMessage::Detach
+              * Wait for ServerMessage::Detached
+              * Print "detached (from session &lt;name&gt;)" and exit terminal loop cleanly
+
+           b) Workspace prefix commands:
+              * Ctrl+B c → send CreateWorkspace, on WorkspaceCreated switch locally
+              * Ctrl+B n → switch to next workspace (wrapping)
+              * Ctrl+B p → switch to previous workspace
+              * Ctrl+B 0-9 → switch to workspace by index
+              * Ctrl+B &amp; → close current workspace (or Ctrl+B shift+x)
+
+           c) Handle new ServerMessage variants:
+              * WorkspaceCreated → create workspace in PaneManager
+              * WorkspaceClosed → remove workspace in PaneManager
+              * WorkspaceSwitched → switch active workspace
+              * SessionState → rebuild PaneManager (on initial attach)
+              * Detached → exit terminal loop
+
+           d) Status bar integration:
+              * After each render, draw status bar at terminal bottom
+              * Layout gets terminal_rows - 1 for pane area
+
+        4. Update cmux-client/src/main.rs:
+
+           - attach command: connect, send Attach, wait for SessionState, rebuild PaneManager, enter terminal loop
+           - new command: connect, send CreateSession, wait for SessionCreated + SessionState, enter terminal loop
       </action>
 
       <verification>
@@ -423,27 +226,66 @@
         <command>cargo fmt --all --check</command>
         <command>cargo test --workspace</command>
         <manual>
-          1. Start daemon, then client with new session
-          2. Press Ctrl+B then % → terminal splits vertically, new shell in right pane
-          3. Press Ctrl+B then " → active pane splits horizontally
-          4. Press Ctrl+B then arrow keys → navigate between panes
-          5. Type in each pane → only active pane receives input
-          6. Press Ctrl+B then z → active pane zooms to full screen
-          7. Press Ctrl+B then z → unzoom, all panes visible again
-          8. Press Ctrl+B then x → close active pane, sibling expands
-          9. Resize terminal → all panes redistribute
+          1. Start daemon, create session: cmux-client new -s main
+          2. Press Ctrl+B d → detaches, prints message, exits
+          3. Run cmux-client attach -t main → reattaches, sees same panes
+          4. Press Ctrl+B c → new workspace (tab)
+          5. Press Ctrl+B n/p → switch between workspaces
+          6. Status bar at bottom shows session name and workspace list
+          7. Press Ctrl+B 0 → switch to workspace 0
+          8. Start second client attached to same session → both work
         </manual>
       </verification>
 
       <done>
-        - Ctrl+B prefix key triggers split, navigate, zoom, close
-        - Multiple panes each run independent shell processes
-        - Each pane renders its own screen buffer at correct layout position
-        - Pane borders drawn with active pane highlighted
-        - Input routes to active pane only
-        - Pane close removes pane, sibling expands
-        - Zoom temporarily maximizes active pane
+        - Ctrl+B d detaches cleanly, daemon keeps panes alive
+        - cmux attach -t &lt;name&gt; reattaches and restores UI state
+        - Workspaces: create (Ctrl+B c), next/prev (n/p), select (0-9)
+        - Status bar shows session name and workspace tabs
+        - Layout area correctly sized (terminal_rows - 1 for status bar)
+        - Multiple clients can attach to same session
         - All tests pass
+      </done>
+    </task>
+
+    <task id="3" type="test" complete="false">
+      <name>Session lifecycle and workspace unit tests</name>
+      <description>
+        Add unit tests for workspace management, session state queries, and
+        IPC message serialization for the new message types.
+      </description>
+
+      <files>
+        <modify>
+          cmux-ipc/src/messages.rs              (tests for new message variants)
+          cmux-core/src/layout.rs               (test workspace-related layout scenarios if needed)
+        </modify>
+      </files>
+
+      <action>
+        1. IPC message tests (cmux-ipc/src/messages.rs):
+           - CreateWorkspace round-trip
+           - CloseWorkspace round-trip
+           - SwitchWorkspace round-trip
+           - SessionState with multiple workspaces round-trip
+           - WorkspaceInfo serialization
+           - Detached message round-trip
+
+        2. Session state tests:
+           - Verify SessionState contains correct workspace and pane info
+           - Verify workspace IDs are unique
+           - Verify pane IDs are globally unique across workspaces
+      </action>
+
+      <verification>
+        <command>cargo test --workspace</command>
+      </verification>
+
+      <done>
+        - All new IPC message types have serialization round-trip tests
+        - Session state structure tests pass
+        - All previous tests still pass
+        - cargo test --workspace exits 0
       </done>
     </task>
   </tasks>
@@ -456,22 +298,21 @@
       <command>cargo test --workspace</command>
     </commands>
     <manual>
-      1. Start daemon + client
-      2. Split panes (Ctrl+B % and Ctrl+B ")
-      3. Navigate between panes (Ctrl+B arrows)
-      4. Type in different panes — verify isolation
-      5. Zoom (Ctrl+B z) and unzoom
-      6. Close pane (Ctrl+B x) — sibling expands
-      7. Resize terminal window — panes redistribute
+      1. Start daemon + client with new session
+      2. Detach (Ctrl+B d) — verify message printed, daemon still running
+      3. Reattach (cmux attach) — verify panes restored
+      4. Create/switch workspaces (Ctrl+B c/n/p/0-9)
+      5. Status bar shows correct workspace info
+      6. Multiple clients on same session
     </manual>
   </phase_verification>
 
   <completion_criteria>
     <criterion>All 3 tasks marked complete</criterion>
     <criterion>cargo build/clippy/fmt/test all pass</criterion>
-    <criterion>Multi-pane terminal works interactively</criterion>
-    <criterion>Pane borders rendered with Unicode box-drawing</criterion>
-    <criterion>Active pane highlighted and receives input</criterion>
-    <criterion>Layout engine unit tests comprehensive</criterion>
+    <criterion>Detach/reattach preserves session state</criterion>
+    <criterion>Workspace create/switch/close works</criterion>
+    <criterion>Status bar renders at terminal bottom</criterion>
+    <criterion>Multiple clients can attach to same session</criterion>
   </completion_criteria>
 </plan>

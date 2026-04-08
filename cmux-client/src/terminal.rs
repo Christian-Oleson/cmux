@@ -1,10 +1,12 @@
 use crate::pane_manager::PaneManager;
-use crate::renderer::Renderer;
+use crate::renderer::{self, Renderer};
 use cmux_core::layout::SplitDirection;
+use cmux_core::types::PaneId;
 use cmux_ipc::messages::{ClientMessage, ServerMessage};
 use cmux_ipc::transport;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use std::io::Write;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_stream::StreamExt;
 use tracing::debug;
@@ -13,6 +15,12 @@ use tracing::debug;
 enum InputMode {
     Normal,
     WaitingForPrefixCommand,
+}
+
+/// Action returned from prefix command handling that the main loop must act on.
+enum PrefixAction {
+    None,
+    Detach,
 }
 
 struct RawModeGuard;
@@ -39,7 +47,7 @@ impl Drop for RawModeGuard {
 pub async fn run_terminal<R, W>(
     mut pipe_reader: R,
     mut pipe_writer: W,
-    _session_name: &str,
+    session_name: &str,
 ) -> anyhow::Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -50,10 +58,28 @@ where
     let (cols, rows) = crossterm::terminal::size()?;
     debug!(cols, rows, "Terminal size");
 
-    let mut panes = PaneManager::new(rows, cols);
+    // Reserve bottom row for status bar
+    let layout_rows = rows.saturating_sub(1).max(1);
+
+    let mut panes = PaneManager::new_with_session(session_name.to_string(), layout_rows, cols);
     let mut renderer = Renderer::new();
     let mut input_mode = InputMode::Normal;
     let mut event_stream = EventStream::new();
+
+    // Initial full render with status bar
+    {
+        let snaps = panes.snapshots();
+        let mut stdout = std::io::stdout().lock();
+        renderer.render_full(&snaps, panes.layout(), panes.active_pane(), &mut stdout)?;
+        renderer::render_status_bar(
+            &mut stdout,
+            panes.session_name(),
+            &panes.workspace_list(),
+            cols,
+            rows.saturating_sub(1),
+        )?;
+        stdout.flush()?;
+    }
 
     loop {
         tokio::select! {
@@ -81,18 +107,25 @@ where
                             }
                             InputMode::WaitingForPrefixCommand => {
                                 input_mode = InputMode::Normal;
-                                handle_prefix_command(
+                                let action = handle_prefix_command(
                                     &key_event,
                                     &mut panes,
                                     &mut renderer,
                                     &mut pipe_writer,
+                                    cols,
+                                    rows,
                                 ).await?;
+                                match action {
+                                    PrefixAction::Detach => break,
+                                    PrefixAction::None => {}
+                                }
                             }
                         }
                     }
                     Some(Ok(Event::Resize(new_cols, new_rows))) => {
                         debug!(cols = new_cols, rows = new_rows, "Terminal resized");
-                        panes.resize_terminal(new_rows, new_cols);
+                        let new_layout_rows = new_rows.saturating_sub(1).max(1);
+                        panes.resize_terminal(new_layout_rows, new_cols);
                         let snaps = panes.snapshots();
                         let mut stdout = std::io::stdout().lock();
                         renderer.render_full(
@@ -101,6 +134,14 @@ where
                             panes.active_pane(),
                             &mut stdout,
                         )?;
+                        renderer::render_status_bar(
+                            &mut stdout,
+                            panes.session_name(),
+                            &panes.workspace_list(),
+                            new_cols,
+                            new_rows.saturating_sub(1),
+                        )?;
+                        stdout.flush()?;
                     }
                     Some(Ok(Event::Paste(text))) => {
                         let msg = ClientMessage::PaneInput {
@@ -121,7 +162,7 @@ where
             msg = transport::read_message::<_, ServerMessage>(&mut pipe_reader) => {
                 match msg {
                     Ok(Some(ServerMessage::PaneOutput { pane_id, data })) => {
-                        panes.process_output(cmux_core::types::PaneId(pane_id), &data);
+                        panes.process_output(PaneId(pane_id), &data);
                         let snaps = panes.snapshots();
                         let mut stdout = std::io::stdout().lock();
                         renderer.render_diff(
@@ -130,14 +171,119 @@ where
                             panes.active_pane(),
                             &mut stdout,
                         )?;
+                        let (term_cols, term_rows) = crossterm::terminal::size()?;
+                        renderer::render_status_bar(
+                            &mut stdout,
+                            panes.session_name(),
+                            &panes.workspace_list(),
+                            term_cols,
+                            term_rows.saturating_sub(1),
+                        )?;
+                        stdout.flush()?;
                     }
                     Ok(Some(ServerMessage::PaneCreated { pane_id: _, cols: _, rows: _ })) => {
-                        // Pane was created on daemon side — the client already
+                        // Pane was created on daemon side -- the client already
                         // split the layout in handle_prefix_command, so nothing
                         // additional needed here.
                     }
                     Ok(Some(ServerMessage::PaneClosed { pane_id: _ })) => {
                         // Already handled client-side in handle_prefix_command
+                    }
+                    Ok(Some(ServerMessage::WorkspaceCreated { workspace_id, name, pane_id })) => {
+                        let (term_cols, term_rows) = crossterm::terminal::size()?;
+                        let layout_rows = term_rows.saturating_sub(1).max(1);
+                        panes.create_workspace(workspace_id, PaneId(pane_id), name);
+                        panes.switch_workspace(workspace_id);
+                        // Resize the new workspace to current terminal dimensions
+                        panes.resize_terminal(layout_rows, term_cols);
+                        let snaps = panes.snapshots();
+                        let mut stdout = std::io::stdout().lock();
+                        renderer.render_full(
+                            &snaps,
+                            panes.layout(),
+                            panes.active_pane(),
+                            &mut stdout,
+                        )?;
+                        renderer::render_status_bar(
+                            &mut stdout,
+                            panes.session_name(),
+                            &panes.workspace_list(),
+                            term_cols,
+                            term_rows.saturating_sub(1),
+                        )?;
+                        stdout.flush()?;
+                    }
+                    Ok(Some(ServerMessage::WorkspaceClosed { workspace_id })) => {
+                        panes.close_workspace(workspace_id);
+                        let (term_cols, term_rows) = crossterm::terminal::size()?;
+                        let snaps = panes.snapshots();
+                        let mut stdout = std::io::stdout().lock();
+                        renderer.render_full(
+                            &snaps,
+                            panes.layout(),
+                            panes.active_pane(),
+                            &mut stdout,
+                        )?;
+                        renderer::render_status_bar(
+                            &mut stdout,
+                            panes.session_name(),
+                            &panes.workspace_list(),
+                            term_cols,
+                            term_rows.saturating_sub(1),
+                        )?;
+                        stdout.flush()?;
+                    }
+                    Ok(Some(ServerMessage::WorkspaceSwitched { workspace_id })) => {
+                        panes.switch_workspace(workspace_id);
+                        let (term_cols, term_rows) = crossterm::terminal::size()?;
+                        let snaps = panes.snapshots();
+                        let mut stdout = std::io::stdout().lock();
+                        renderer.render_full(
+                            &snaps,
+                            panes.layout(),
+                            panes.active_pane(),
+                            &mut stdout,
+                        )?;
+                        renderer::render_status_bar(
+                            &mut stdout,
+                            panes.session_name(),
+                            &panes.workspace_list(),
+                            term_cols,
+                            term_rows.saturating_sub(1),
+                        )?;
+                        stdout.flush()?;
+                    }
+                    Ok(Some(ServerMessage::SessionState { session_name, workspaces, active_workspace })) => {
+                        let (term_cols, term_rows) = crossterm::terminal::size()?;
+                        let layout_rows = term_rows.saturating_sub(1).max(1);
+                        panes = PaneManager::rebuild_from_state(
+                            session_name,
+                            &workspaces,
+                            active_workspace,
+                            layout_rows,
+                            term_cols,
+                        );
+                        let snaps = panes.snapshots();
+                        let mut stdout = std::io::stdout().lock();
+                        renderer.render_full(
+                            &snaps,
+                            panes.layout(),
+                            panes.active_pane(),
+                            &mut stdout,
+                        )?;
+                        renderer::render_status_bar(
+                            &mut stdout,
+                            panes.session_name(),
+                            &panes.workspace_list(),
+                            term_cols,
+                            term_rows.saturating_sub(1),
+                        )?;
+                        stdout.flush()?;
+                    }
+                    Ok(Some(ServerMessage::Detached)) => {
+                        debug!("Detached from session");
+                        // Clean exit - the RawModeGuard will restore terminal
+                        break;
                     }
                     Ok(Some(ServerMessage::Error { message })) => {
                         eprintln!("\r\ncmux error: {message}\r");
@@ -165,7 +311,11 @@ async fn handle_prefix_command<W: AsyncWrite + Unpin>(
     panes: &mut PaneManager,
     renderer: &mut Renderer,
     pipe_writer: &mut W,
-) -> anyhow::Result<()> {
+    terminal_cols: u16,
+    terminal_rows: u16,
+) -> anyhow::Result<PrefixAction> {
+    let status_row = terminal_rows.saturating_sub(1);
+
     match key.code {
         // Split vertical: prefix + %
         KeyCode::Char('%') => {
@@ -183,6 +333,14 @@ async fn handle_prefix_command<W: AsyncWrite + Unpin>(
             let snaps = panes.snapshots();
             let mut stdout = std::io::stdout().lock();
             renderer.render_full(&snaps, panes.layout(), panes.active_pane(), &mut stdout)?;
+            renderer::render_status_bar(
+                &mut stdout,
+                panes.session_name(),
+                &panes.workspace_list(),
+                terminal_cols,
+                status_row,
+            )?;
+            stdout.flush()?;
         }
 
         // Split horizontal: prefix + "
@@ -199,6 +357,14 @@ async fn handle_prefix_command<W: AsyncWrite + Unpin>(
             let snaps = panes.snapshots();
             let mut stdout = std::io::stdout().lock();
             renderer.render_full(&snaps, panes.layout(), panes.active_pane(), &mut stdout)?;
+            renderer::render_status_bar(
+                &mut stdout,
+                panes.session_name(),
+                &panes.workspace_list(),
+                terminal_cols,
+                status_row,
+            )?;
+            stdout.flush()?;
         }
 
         // Close pane: prefix + x
@@ -210,6 +376,14 @@ async fn handle_prefix_command<W: AsyncWrite + Unpin>(
             let snaps = panes.snapshots();
             let mut stdout = std::io::stdout().lock();
             renderer.render_full(&snaps, panes.layout(), panes.active_pane(), &mut stdout)?;
+            renderer::render_status_bar(
+                &mut stdout,
+                panes.session_name(),
+                &panes.workspace_list(),
+                terminal_cols,
+                status_row,
+            )?;
+            stdout.flush()?;
         }
 
         // Zoom/unzoom: prefix + z
@@ -218,6 +392,14 @@ async fn handle_prefix_command<W: AsyncWrite + Unpin>(
             let snaps = panes.snapshots();
             let mut stdout = std::io::stdout().lock();
             renderer.render_full(&snaps, panes.layout(), panes.active_pane(), &mut stdout)?;
+            renderer::render_status_bar(
+                &mut stdout,
+                panes.session_name(),
+                &panes.workspace_list(),
+                terminal_cols,
+                status_row,
+            )?;
+            stdout.flush()?;
         }
 
         // Cycle pane forward: prefix + o
@@ -226,6 +408,14 @@ async fn handle_prefix_command<W: AsyncWrite + Unpin>(
             let snaps = panes.snapshots();
             let mut stdout = std::io::stdout().lock();
             renderer.render_full(&snaps, panes.layout(), panes.active_pane(), &mut stdout)?;
+            renderer::render_status_bar(
+                &mut stdout,
+                panes.session_name(),
+                &panes.workspace_list(),
+                terminal_cols,
+                status_row,
+            )?;
+            stdout.flush()?;
         }
 
         // Navigate: prefix + arrow keys
@@ -236,6 +426,14 @@ async fn handle_prefix_command<W: AsyncWrite + Unpin>(
             let snaps = panes.snapshots();
             let mut stdout = std::io::stdout().lock();
             renderer.render_diff(&snaps, panes.layout(), panes.active_pane(), &mut stdout)?;
+            renderer::render_status_bar(
+                &mut stdout,
+                panes.session_name(),
+                &panes.workspace_list(),
+                terminal_cols,
+                status_row,
+            )?;
+            stdout.flush()?;
         }
         KeyCode::Down => {
             panes
@@ -244,25 +442,114 @@ async fn handle_prefix_command<W: AsyncWrite + Unpin>(
             let snaps = panes.snapshots();
             let mut stdout = std::io::stdout().lock();
             renderer.render_diff(&snaps, panes.layout(), panes.active_pane(), &mut stdout)?;
+            renderer::render_status_bar(
+                &mut stdout,
+                panes.session_name(),
+                &panes.workspace_list(),
+                terminal_cols,
+                status_row,
+            )?;
+            stdout.flush()?;
         }
         KeyCode::Left => {
             panes.layout_mut().navigate(SplitDirection::Vertical, false);
             let snaps = panes.snapshots();
             let mut stdout = std::io::stdout().lock();
             renderer.render_diff(&snaps, panes.layout(), panes.active_pane(), &mut stdout)?;
+            renderer::render_status_bar(
+                &mut stdout,
+                panes.session_name(),
+                &panes.workspace_list(),
+                terminal_cols,
+                status_row,
+            )?;
+            stdout.flush()?;
         }
         KeyCode::Right => {
             panes.layout_mut().navigate(SplitDirection::Vertical, true);
             let snaps = panes.snapshots();
             let mut stdout = std::io::stdout().lock();
             renderer.render_diff(&snaps, panes.layout(), panes.active_pane(), &mut stdout)?;
+            renderer::render_status_bar(
+                &mut stdout,
+                panes.session_name(),
+                &panes.workspace_list(),
+                terminal_cols,
+                status_row,
+            )?;
+            stdout.flush()?;
         }
 
-        // Unknown prefix command — ignore
+        // Detach: prefix + d
+        KeyCode::Char('d') => {
+            transport::write_message(pipe_writer, &ClientMessage::Detach).await?;
+            // The main loop will break when it receives ServerMessage::Detached,
+            // but we also return a PrefixAction to break immediately if the
+            // server never responds.
+            return Ok(PrefixAction::Detach);
+        }
+
+        // Create workspace: prefix + c
+        KeyCode::Char('c') => {
+            transport::write_message(pipe_writer, &ClientMessage::CreateWorkspace).await?;
+            // The workspace will be created when we receive WorkspaceCreated from the daemon
+        }
+
+        // Next workspace: prefix + n
+        KeyCode::Char('n') => {
+            let ids = panes.workspace_ids_sorted();
+            if ids.len() > 1 {
+                let current = panes.active_workspace_id();
+                let pos = ids.iter().position(|&id| id == current).unwrap_or(0);
+                let next_id = ids[(pos + 1) % ids.len()];
+                transport::write_message(
+                    pipe_writer,
+                    &ClientMessage::SwitchWorkspace {
+                        workspace_id: next_id,
+                    },
+                )
+                .await?;
+            }
+        }
+
+        // Previous workspace: prefix + p
+        KeyCode::Char('p') => {
+            let ids = panes.workspace_ids_sorted();
+            if ids.len() > 1 {
+                let current = panes.active_workspace_id();
+                let pos = ids.iter().position(|&id| id == current).unwrap_or(0);
+                let prev_id = ids[(pos + ids.len() - 1) % ids.len()];
+                transport::write_message(
+                    pipe_writer,
+                    &ClientMessage::SwitchWorkspace {
+                        workspace_id: prev_id,
+                    },
+                )
+                .await?;
+            }
+        }
+
+        // Select workspace by index: prefix + 0-9
+        KeyCode::Char(c @ '0'..='9') => {
+            let idx = c as usize - '0' as usize;
+            let ids = panes.workspace_ids_sorted();
+            if idx < ids.len() {
+                let ws_id = ids[idx];
+                transport::write_message(
+                    pipe_writer,
+                    &ClientMessage::SwitchWorkspace {
+                        workspace_id: ws_id,
+                    },
+                )
+                .await?;
+            }
+        }
+
+        // Unknown prefix command -- ignore
         _ => {}
     }
 
-    Ok(())
+    Ok(PrefixAction::None)
 }
 
 fn key_event_to_bytes(event: &KeyEvent) -> Option<Vec<u8>> {

@@ -12,6 +12,10 @@ pub enum ClientMessage {
     PaneInput { pane_id: u32, data: Vec<u8> },
     SplitPane { direction: String },
     ClosePane { pane_id: u32 },
+    CreateWorkspace,
+    CloseWorkspace { workspace_id: u32 },
+    SwitchWorkspace { workspace_id: u32 },
+    GetSessionState,
 }
 
 /// Session info returned in listings.
@@ -23,16 +27,57 @@ pub struct SessionInfo {
     pub created_at: u64,
 }
 
+/// Info about a workspace within a session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceInfo {
+    pub id: u32,
+    pub name: String,
+    pub pane_ids: Vec<u32>,
+}
+
 /// Messages sent from daemon to client.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ServerMessage {
-    SessionCreated { id: u32, name: String },
-    SessionList { sessions: Vec<SessionInfo> },
-    PaneOutput { pane_id: u32, data: Vec<u8> },
-    PaneCreated { pane_id: u32, cols: u16, rows: u16 },
-    PaneClosed { pane_id: u32 },
-    Error { message: String },
+    SessionCreated {
+        id: u32,
+        name: String,
+    },
+    SessionList {
+        sessions: Vec<SessionInfo>,
+    },
+    PaneOutput {
+        pane_id: u32,
+        data: Vec<u8>,
+    },
+    PaneCreated {
+        pane_id: u32,
+        cols: u16,
+        rows: u16,
+    },
+    PaneClosed {
+        pane_id: u32,
+    },
+    WorkspaceCreated {
+        workspace_id: u32,
+        name: String,
+        pane_id: u32,
+    },
+    WorkspaceClosed {
+        workspace_id: u32,
+    },
+    WorkspaceSwitched {
+        workspace_id: u32,
+    },
+    SessionState {
+        session_name: String,
+        workspaces: Vec<WorkspaceInfo>,
+        active_workspace: u32,
+    },
+    Detached,
+    Error {
+        message: String,
+    },
     Ok,
 }
 
@@ -74,7 +119,7 @@ mod tests {
     fn pane_input_with_bytes() {
         let msg = ClientMessage::PaneInput {
             pane_id: 0,
-            data: vec![0x1b, 0x5b, 0x41], // ESC [ A (arrow up)
+            data: vec![0x1b, 0x5b, 0x41],
         };
         let json = serde_json::to_string(&msg).unwrap();
         let back: ClientMessage = serde_json::from_str(&json).unwrap();
@@ -105,5 +150,68 @@ mod tests {
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("main"));
         assert!(json.contains("dev"));
+    }
+
+    #[test]
+    fn workspace_info_round_trip() {
+        let info = WorkspaceInfo {
+            id: 0,
+            name: "main".into(),
+            pane_ids: vec![0, 1, 2],
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        let back: WorkspaceInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.id, 0);
+        assert_eq!(back.pane_ids, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn session_state_round_trip() {
+        let msg = ServerMessage::SessionState {
+            session_name: "dev".into(),
+            workspaces: vec![
+                WorkspaceInfo {
+                    id: 0,
+                    name: "0".into(),
+                    pane_ids: vec![0, 1],
+                },
+                WorkspaceInfo {
+                    id: 1,
+                    name: "1".into(),
+                    pane_ids: vec![2],
+                },
+            ],
+            active_workspace: 1,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let back: ServerMessage = serde_json::from_str(&json).unwrap();
+        match back {
+            ServerMessage::SessionState {
+                session_name,
+                workspaces,
+                active_workspace,
+            } => {
+                assert_eq!(session_name, "dev");
+                assert_eq!(workspaces.len(), 2);
+                assert_eq!(active_workspace, 1);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn create_workspace_round_trip() {
+        let msg = ClientMessage::CreateWorkspace;
+        let json = serde_json::to_string(&msg).unwrap();
+        let back: ClientMessage = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, ClientMessage::CreateWorkspace));
+    }
+
+    #[test]
+    fn detached_round_trip() {
+        let msg = ServerMessage::Detached;
+        let json = serde_json::to_string(&msg).unwrap();
+        let back: ServerMessage = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, ServerMessage::Detached));
     }
 }

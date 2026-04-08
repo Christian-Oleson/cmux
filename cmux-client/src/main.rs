@@ -86,8 +86,12 @@ async fn main() -> anyhow::Result<()> {
             }
 
             // Enter interactive terminal mode
+            // The daemon may send a SessionState message once we're in the
+            // terminal loop, which will rebuild the PaneManager.
             let (reader, writer) = conn.split();
             terminal::run_terminal(reader, writer, &session_name).await?;
+
+            println!("[detached]");
         }
 
         Some(Commands::Attach { target }) => {
@@ -106,8 +110,11 @@ async fn main() -> anyhow::Result<()> {
             })
             .await?;
 
+            // Wait for Ok or Error confirming the attach
             match conn.recv().await? {
-                Some(ServerMessage::Ok) => {}
+                Some(ServerMessage::Ok) => {
+                    info!("Attached to session");
+                }
                 Some(ServerMessage::Error { message }) => {
                     eprintln!("cmux: {message}");
                     std::process::exit(1);
@@ -118,8 +125,13 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
 
+            // Enter interactive terminal mode.
+            // The daemon will send a SessionState message to rebuild workspace
+            // state within the terminal loop.
             let (reader, writer) = conn.split();
             terminal::run_terminal(reader, writer, &target).await?;
+
+            println!("[detached]");
         }
 
         Some(Commands::Ls) => {

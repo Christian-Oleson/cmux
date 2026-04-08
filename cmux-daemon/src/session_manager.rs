@@ -1,6 +1,6 @@
 use cmux_core::error::CmuxError;
 use cmux_core::pty::{ConPty, ConPtyConfig};
-use cmux_ipc::messages::{ServerMessage, SessionInfo};
+use cmux_ipc::messages::{ServerMessage, SessionInfo, WorkspaceInfo};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex};
@@ -10,10 +10,18 @@ struct ManagedPane {
     pty: Arc<ConPty>,
 }
 
-struct ManagedSession {
+struct ManagedWorkspace {
     id: u32,
     name: String,
     panes: HashMap<u32, ManagedPane>,
+}
+
+struct ManagedSession {
+    id: u32,
+    name: String,
+    workspaces: HashMap<u32, ManagedWorkspace>,
+    active_workspace: u32,
+    next_workspace_id: u32,
     next_pane_id: u32,
     created_at: u64,
 }
@@ -63,10 +71,22 @@ impl SessionManager {
         });
     }
 
+    fn spawn_pty(&self, pane_id: u32, cols: u16, rows: u16) -> Result<ManagedPane, CmuxError> {
+        let config = ConPtyConfig {
+            cols,
+            rows,
+            ..ConPtyConfig::default()
+        };
+        let pty =
+            Arc::new(ConPty::spawn(&config).map_err(|e| CmuxError::Pty(format!("spawn: {e}")))?);
+        Self::spawn_pane_reader(Arc::clone(&pty), pane_id, self.output_tx.clone());
+        Ok(ManagedPane { pty })
+    }
+
     pub async fn create_session(
         &self,
         name: String,
-        shell: Option<String>,
+        _shell: Option<String>,
     ) -> Result<(u32, String), CmuxError> {
         let mut sessions = self.sessions.lock().await;
 
@@ -74,24 +94,23 @@ impl SessionManager {
             return Err(CmuxError::Ipc(format!("Session '{}' already exists", name)));
         }
 
-        let mut id = self.next_session_id.lock().await;
-        let session_id = *id;
-        *id += 1;
+        let mut sid = self.next_session_id.lock().await;
+        let session_id = *sid;
+        *sid += 1;
 
-        let config = ConPtyConfig {
-            shell: shell.unwrap_or_else(|| cmux_config::defaults::DEFAULT_SHELL.into()),
-            ..ConPtyConfig::default()
-        };
-
-        let pty =
-            Arc::new(ConPty::spawn(&config).map_err(|e| CmuxError::Pty(format!("spawn: {e}")))?);
-
-        // Pane 0 is the initial pane
         let pane_id = 0u32;
-        Self::spawn_pane_reader(Arc::clone(&pty), pane_id, self.output_tx.clone());
+        let pane = self.spawn_pty(pane_id, 80, 24)?;
 
         let mut panes = HashMap::new();
-        panes.insert(pane_id, ManagedPane { pty });
+        panes.insert(pane_id, pane);
+
+        let workspace = ManagedWorkspace {
+            id: 0,
+            name: "0".into(),
+            panes,
+        };
+        let mut workspaces = HashMap::new();
+        workspaces.insert(0u32, workspace);
 
         let created_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -103,7 +122,9 @@ impl SessionManager {
             ManagedSession {
                 id: session_id,
                 name: name.clone(),
-                panes,
+                workspaces,
+                active_workspace: 0,
+                next_workspace_id: 1,
                 next_pane_id: 1,
                 created_at,
             },
@@ -127,18 +148,13 @@ impl SessionManager {
         let pane_id = session.next_pane_id;
         session.next_pane_id += 1;
 
-        let config = ConPtyConfig {
-            cols,
-            rows,
-            ..ConPtyConfig::default()
-        };
+        let pane = self.spawn_pty(pane_id, cols, rows)?;
 
-        let pty =
-            Arc::new(ConPty::spawn(&config).map_err(|e| CmuxError::Pty(format!("spawn: {e}")))?);
-
-        Self::spawn_pane_reader(Arc::clone(&pty), pane_id, self.output_tx.clone());
-
-        session.panes.insert(pane_id, ManagedPane { pty });
+        let ws = session
+            .workspaces
+            .get_mut(&session.active_workspace)
+            .ok_or_else(|| CmuxError::Ipc("No active workspace".into()))?;
+        ws.panes.insert(pane_id, pane);
 
         info!(pane_id, session = %session_name, "Pane created");
         Ok((pane_id, cols, rows))
@@ -150,25 +166,137 @@ impl SessionManager {
             .get_mut(session_name)
             .ok_or_else(|| CmuxError::SessionNotFound(session_name.into()))?;
 
-        match session.panes.remove(&pane_id) {
-            Some(pane) => {
+        for ws in session.workspaces.values_mut() {
+            if let Some(pane) = ws.panes.remove(&pane_id) {
                 let _ = pane.pty.kill();
                 info!(pane_id, session = %session_name, "Pane closed");
-                Ok(())
+                return Ok(());
             }
-            None => Err(CmuxError::PaneNotFound(cmux_core::types::PaneId(pane_id))),
         }
+        Err(CmuxError::PaneNotFound(cmux_core::types::PaneId(pane_id)))
+    }
+
+    pub async fn create_workspace(
+        &self,
+        session_name: &str,
+    ) -> Result<(u32, String, u32), CmuxError> {
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions
+            .get_mut(session_name)
+            .ok_or_else(|| CmuxError::SessionNotFound(session_name.into()))?;
+
+        let ws_id = session.next_workspace_id;
+        session.next_workspace_id += 1;
+
+        let pane_id = session.next_pane_id;
+        session.next_pane_id += 1;
+
+        let pane = self.spawn_pty(pane_id, 80, 24)?;
+
+        let mut panes = HashMap::new();
+        panes.insert(pane_id, pane);
+
+        let ws_name = ws_id.to_string();
+        session.workspaces.insert(
+            ws_id,
+            ManagedWorkspace {
+                id: ws_id,
+                name: ws_name.clone(),
+                panes,
+            },
+        );
+        session.active_workspace = ws_id;
+
+        info!(workspace_id = ws_id, session = %session_name, "Workspace created");
+        Ok((ws_id, ws_name, pane_id))
+    }
+
+    pub async fn close_workspace(
+        &self,
+        session_name: &str,
+        workspace_id: u32,
+    ) -> Result<(), CmuxError> {
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions
+            .get_mut(session_name)
+            .ok_or_else(|| CmuxError::SessionNotFound(session_name.into()))?;
+
+        if session.workspaces.len() <= 1 {
+            return Err(CmuxError::Ipc("Cannot close last workspace".into()));
+        }
+
+        if let Some(ws) = session.workspaces.remove(&workspace_id) {
+            for pane in ws.panes.values() {
+                let _ = pane.pty.kill();
+            }
+            if session.active_workspace == workspace_id {
+                session.active_workspace = *session.workspaces.keys().next().unwrap_or(&0);
+            }
+            info!(workspace_id, session = %session_name, "Workspace closed");
+            Ok(())
+        } else {
+            Err(CmuxError::Ipc(format!(
+                "Workspace {} not found",
+                workspace_id
+            )))
+        }
+    }
+
+    pub async fn switch_workspace(
+        &self,
+        session_name: &str,
+        workspace_id: u32,
+    ) -> Result<(), CmuxError> {
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions
+            .get_mut(session_name)
+            .ok_or_else(|| CmuxError::SessionNotFound(session_name.into()))?;
+
+        if !session.workspaces.contains_key(&workspace_id) {
+            return Err(CmuxError::Ipc(format!(
+                "Workspace {} not found",
+                workspace_id
+            )));
+        }
+        session.active_workspace = workspace_id;
+        Ok(())
+    }
+
+    pub async fn get_session_state(
+        &self,
+        session_name: &str,
+    ) -> Result<(String, Vec<WorkspaceInfo>, u32), CmuxError> {
+        let sessions = self.sessions.lock().await;
+        let session = sessions
+            .get(session_name)
+            .ok_or_else(|| CmuxError::SessionNotFound(session_name.into()))?;
+
+        let mut workspaces: Vec<WorkspaceInfo> = session
+            .workspaces
+            .values()
+            .map(|ws| WorkspaceInfo {
+                id: ws.id,
+                name: ws.name.clone(),
+                pane_ids: ws.panes.keys().copied().collect(),
+            })
+            .collect();
+        workspaces.sort_by_key(|w| w.id);
+
+        Ok((session.name.clone(), workspaces, session.active_workspace))
     }
 
     pub async fn list_sessions(&self) -> Vec<SessionInfo> {
         let sessions = self.sessions.lock().await;
         sessions
             .values()
-            .map(|s| SessionInfo {
-                id: s.id,
-                name: s.name.clone(),
-                pane_count: s.panes.len(),
-                created_at: s.created_at,
+            .map(|s| {
+                let pane_count: usize = s.workspaces.values().map(|ws| ws.panes.len()).sum();
+                SessionInfo {
+                    id: s.id,
+                    name: s.name.clone(),
+                    pane_count,
+                    created_at: s.created_at,
+                }
             })
             .collect()
     }
@@ -177,8 +305,10 @@ impl SessionManager {
         let mut sessions = self.sessions.lock().await;
         match sessions.remove(name) {
             Some(session) => {
-                for pane in session.panes.values() {
-                    let _ = pane.pty.kill();
+                for ws in session.workspaces.values() {
+                    for pane in ws.panes.values() {
+                        let _ = pane.pty.kill();
+                    }
                 }
                 info!(name = %name, "Session killed");
                 Ok(())
@@ -197,12 +327,13 @@ impl SessionManager {
         let session = sessions
             .get(session_name)
             .ok_or_else(|| CmuxError::SessionNotFound(session_name.into()))?;
-        match session.panes.get(&pane_id) {
-            Some(pane) => {
+
+        for ws in session.workspaces.values() {
+            if let Some(pane) = ws.panes.get(&pane_id) {
                 pane.pty.write(data).await?;
-                Ok(())
+                return Ok(());
             }
-            None => Err(CmuxError::PaneNotFound(cmux_core::types::PaneId(pane_id))),
         }
+        Err(CmuxError::PaneNotFound(cmux_core::types::PaneId(pane_id)))
     }
 }

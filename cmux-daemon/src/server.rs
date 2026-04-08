@@ -104,8 +104,22 @@ where
 
                         attached_session = Some(name.clone());
                         let _ = resp_tx
-                            .send(ServerMessage::SessionCreated { id, name })
+                            .send(ServerMessage::SessionCreated {
+                                id,
+                                name: name.clone(),
+                            })
                             .await;
+
+                        // Send initial session state
+                        if let Ok((sn, ws, aw)) = session_manager.get_session_state(&name).await {
+                            let _ = resp_tx
+                                .send(ServerMessage::SessionState {
+                                    session_name: sn,
+                                    workspaces: ws,
+                                    active_workspace: aw,
+                                })
+                                .await;
+                        }
                     }
                     Err(e) => {
                         let _ = resp_tx
@@ -149,7 +163,26 @@ where
                     }
                 }));
                 attached_session = Some(session.clone());
-                let _ = resp_tx.send(ServerMessage::Ok).await;
+
+                // Send session state so client can rebuild UI
+                match session_manager.get_session_state(&session).await {
+                    Ok((session_name, workspaces, active_workspace)) => {
+                        let _ = resp_tx
+                            .send(ServerMessage::SessionState {
+                                session_name,
+                                workspaces,
+                                active_workspace,
+                            })
+                            .await;
+                    }
+                    Err(e) => {
+                        let _ = resp_tx
+                            .send(ServerMessage::Error {
+                                message: e.to_string(),
+                            })
+                            .await;
+                    }
+                }
             }
 
             ClientMessage::Detach => {
@@ -157,7 +190,7 @@ where
                     task.abort();
                 }
                 attached_session = None;
-                let _ = resp_tx.send(ServerMessage::Ok).await;
+                let _ = resp_tx.send(ServerMessage::Detached).await;
             }
 
             ClientMessage::PaneInput { pane_id, data } => {
@@ -200,6 +233,96 @@ where
                     match session_manager.close_pane(session_name, pane_id).await {
                         Ok(()) => {
                             let _ = resp_tx.send(ServerMessage::PaneClosed { pane_id }).await;
+                        }
+                        Err(e) => {
+                            let _ = resp_tx
+                                .send(ServerMessage::Error {
+                                    message: e.to_string(),
+                                })
+                                .await;
+                        }
+                    }
+                }
+            }
+
+            ClientMessage::CreateWorkspace => {
+                if let Some(ref session_name) = attached_session {
+                    match session_manager.create_workspace(session_name).await {
+                        Ok((workspace_id, name, pane_id)) => {
+                            let _ = resp_tx
+                                .send(ServerMessage::WorkspaceCreated {
+                                    workspace_id,
+                                    name,
+                                    pane_id,
+                                })
+                                .await;
+                        }
+                        Err(e) => {
+                            let _ = resp_tx
+                                .send(ServerMessage::Error {
+                                    message: e.to_string(),
+                                })
+                                .await;
+                        }
+                    }
+                }
+            }
+
+            ClientMessage::CloseWorkspace { workspace_id } => {
+                if let Some(ref session_name) = attached_session {
+                    match session_manager
+                        .close_workspace(session_name, workspace_id)
+                        .await
+                    {
+                        Ok(()) => {
+                            let _ = resp_tx
+                                .send(ServerMessage::WorkspaceClosed { workspace_id })
+                                .await;
+                        }
+                        Err(e) => {
+                            let _ = resp_tx
+                                .send(ServerMessage::Error {
+                                    message: e.to_string(),
+                                })
+                                .await;
+                        }
+                    }
+                }
+            }
+
+            ClientMessage::SwitchWorkspace { workspace_id } => {
+                if let Some(ref session_name) = attached_session {
+                    match session_manager
+                        .switch_workspace(session_name, workspace_id)
+                        .await
+                    {
+                        Ok(()) => {
+                            let _ = resp_tx
+                                .send(ServerMessage::WorkspaceSwitched { workspace_id })
+                                .await;
+                        }
+                        Err(e) => {
+                            let _ = resp_tx
+                                .send(ServerMessage::Error {
+                                    message: e.to_string(),
+                                })
+                                .await;
+                        }
+                    }
+                }
+            }
+
+            ClientMessage::GetSessionState => {
+                if let Some(ref session_name) = attached_session {
+                    match session_manager.get_session_state(session_name).await {
+                        Ok((session_name, workspaces, active_workspace)) => {
+                            let _ = resp_tx
+                                .send(ServerMessage::SessionState {
+                                    session_name,
+                                    workspaces,
+                                    active_workspace,
+                                })
+                                .await;
                         }
                         Err(e) => {
                             let _ = resp_tx
