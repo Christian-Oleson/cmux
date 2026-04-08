@@ -515,8 +515,13 @@ where
         }
     }
 
-    // Reader task is joined on the way out. It will exit naturally when
-    // the pipe closes (client drops writer + daemon drops its end).
+    // Drop the writer half so the daemon's read side gets EOF and tears
+    // down its per-client state. The reader task will still be blocked in
+    // read_message waiting for bytes that aren't coming, so abort it
+    // explicitly — this is safe because tokio's async named pipe read is
+    // cancellable at the next await point.
+    drop(pipe_writer);
+    reader_handle.abort();
     let _ = reader_handle.await;
     Ok(())
 }
