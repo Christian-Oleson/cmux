@@ -1,6 +1,12 @@
 /target
 **/*.rs.bk
 key_dump.log
+
+# WiX build artifacts (keep wix/main.wxs, ignore intermediates)
+**/wix/*.wixobj
+**/wix/*.wixpdb
+**/wix/*.wixout
+**/*.msi
 *.pdb
 *.exe
 *.dll

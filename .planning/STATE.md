@@ -2,9 +2,15 @@
 
 ## Current Position
 
-- **Phase:** 9 - CLI Polish, Error Handling & Distribution
-- **Task:** All complete
-- **Status:** **v1.0 SHIPPED** :tada:
+- **Phase:** Install (post-v1.0) — MSI Installer via cargo-wix
+- **Task:** 1 (pending)
+- **Status:** planned
+
+## Plan Created
+
+- Timestamp: 2026-04-08
+- Tasks: 2
+- Estimated complexity: Low-Medium (mostly WiX XML plumbing)
 
 ## Progress
 
@@ -18,97 +24,55 @@
 | 6 | Copy Mode & Scrollback | :white_check_mark: Complete | 2/2 |
 | 7 | Configuration & Themes | :white_check_mark: Complete | 2/2 |
 | 8 | JSON-RPC API & Agent Integration | :white_check_mark: Complete | 3/3 |
-| 9 | CLI Polish, Error Handling & Distribution | :white_check_mark: Complete | 3/3 |
+| 9 | CLI Polish & Distribution (v1.0) | :white_check_mark: Complete | 3/3 |
+| **Install** | **MSI Installer via cargo-wix** | :arrows_counterclockwise: **Planned** | **0/2** |
 
-**Totals:** 9/9 phases, 25/25 tasks, **168 tests** all passing.
+## Phase Install Task Breakdown
 
-## Verification Status
+| Task | Name | Type | Status |
+|------|------|------|--------|
+| 1 | Local MSI build: cargo-wix init, hand-edit wix/main.wxs for 2 binaries + docs + PATH | setup | Pending |
+| 2 | Wire MSI into release.yml workflow and document install in README | deploy | Pending |
 
-| Check | Status |
-|-------|--------|
-| cargo build --workspace | :white_check_mark: Pass |
-| cargo build --release --workspace | :white_check_mark: Pass (daemon 2.7 MB, client 3.1 MB) |
-| cargo clippy --workspace --all-targets | :white_check_mark: Pass (-D warnings) |
-| cargo fmt --all --check | :white_check_mark: Pass |
-| cargo test --workspace (168 tests) | :white_check_mark: Pass |
-| README.md | :white_check_mark: Comprehensive |
-| CI workflow | :white_check_mark: .github/workflows/ci.yml |
-| Release workflow | :white_check_mark: .github/workflows/release.yml |
+## Decisions
 
-## Feature Inventory
+- 2026-04-08: cargo-wix 0.3.x + WiX 3.11 (pre-installed on windows-latest)
+- 2026-04-08: Per-machine install to Program Files\cmux, adds install dir to system PATH (needs admin)
+- 2026-04-08: Single MSI packages both binaries — hand-edit wix/main.wxs to add cmux-client.exe as a second Component
+- 2026-04-08: Also install README.md, cmux.example.toml, cmux-rpc.ps1 to install dir
+- 2026-04-08: Stable UpgradeCode GUID committed once, never regenerated (upgrade correctness)
+- 2026-04-08: No code signing — document SmartScreen warning in README
+- 2026-04-08: Package metadata lives in cmux-daemon/Cargo.toml under [package.metadata.wix]
+- 2026-04-08: `cargo wix` is invoked with `-p cmux-daemon` because cargo-wix expects a single bin crate
 
-**Core:**
-- Windows ConPTY integration via portable-pty
-- Named Pipe IPC with length-prefixed JSON framing
-- Client-server architecture (daemon + interactive client + RPC clients)
-- Binary split tree layout engine
-- vt100-based screen buffer with 10K-line scrollback
-- Crossterm differential renderer
-- Multi-pane with Unicode box-drawing borders
-- Sessions -> workspaces -> panes hierarchy
-- Detach (daemon keeps sessions alive)
-- Reattach with full screen state replay (via vt100 contents_formatted)
+## Explicitly Deferred
 
-**Input:**
-- Configurable tmux-compatible keybindings (default: Ctrl+B prefix)
-- Prefix key system with KeyTable dispatch
-- Mouse click to select pane
-- Mouse scroll wheel forwarding
-- Vi-style copy mode with selection highlighting
-- Windows clipboard integration (clipboard-win)
-- Bracketed paste
+- Code signing (requires ~$200/yr cert)
+- Per-user install without PATH
+- Start Menu shortcuts
+- Windows Service registration for daemon
+- WinGet / Scoop / Chocolatey manifests (can ride on MSI once it exists)
 
-**Configuration:**
-- TOML config at %APPDATA%\cmux\config.toml or ~/.cmux.toml
-- 4 built-in themes: Dracula, Catppuccin, Nord, Solarized Dark
-- Customizable prefix key and bindings via config
+## Known Risks
 
-**Agent Integration:**
-- JSON-RPC 2.0 API on \\.\pipe\cmux-rpc (separate from interactive pipe)
-- 14 methods: session.*, workspace.*, surface.*, notify.*
-- Per-pane ScreenBuffer in daemon for surface.read_output
-- Concurrent RPC clients supported
-- PowerShell client helper at scripts/cmux-rpc.ps1
-- 8 integration tests exercise full round-trips
-
-**Polish:**
-- Alternate screen buffer (host terminal preserved)
-- Structured logging to %APPDATA%\cmux\cmux.log.YYYY-MM-DD (daily rotation)
-- Graceful shutdown on Ctrl+C (kills all PTYs cleanly)
-- Full CLI: new, attach, ls, kill-session, list-panes, list-windows, send-keys
-- Diagnostic example: cargo run -p cmux-client --example key_dump
-
-## Explicitly Deferred (post-v1.0)
-
-- MSI installer, WinGet/Scoop/Chocolatey package manifests
-- Session state persistence across daemon restarts
-- OSC 9/99/777 toast notifications (notify.send is log-only)
-- Interactive command mode (Ctrl+B :)
-- Real rename-session / rename-window (stubbed)
-- Scrollback search in copy mode (actions wired, search logic stubbed)
-- Scrollback history navigation in copy mode
-- JSON-RPC event streaming subscriptions (agents poll)
-- Cross-platform Linux/macOS support
+1. cargo-wix + workspace friction (may need `-p cmux-daemon` or run from cmux-daemon/ dir)
+2. WiX 3 vs 4/5 version confusion — sticking with WiX 3 for CI compatibility
+3. GUID stability between versions — must not regenerate
+4. Admin requirement for PATH — acceptable for stated use case
+5. SmartScreen warning — documented, only fix is signing
 
 ## Session Log
 
-- 2026-04-07: Project initialized from REQUIREMENTS.md PRD
-- 2026-04-07: Phase 1 complete — 25 tests
-- 2026-04-07: Phase 2 complete — 45 tests
-- 2026-04-07: Phase 3 complete — 58 tests
-- 2026-04-07: Phase 4 complete — 75 tests
-- 2026-04-07: Phase 5 complete — 90 tests
-- 2026-04-07: Phase 6 complete — 115 tests
-- 2026-04-07: Phase 7 complete — 154 tests
-- 2026-04-07: Phase 8 complete — 168 tests, JSON-RPC API verified end-to-end
-- 2026-04-08: Phase 9 complete — v1.0 shipped
+- 2026-04-07: Phases 1-8 complete
+- 2026-04-08: Phase 9 complete — v1.0 shipped, 168 tests
+- 2026-04-08: Three post-v1.0 hotfixes merged (SHIFT stripping, cancellation safety, detach hang)
+- 2026-04-08: User verified interactive client works end-to-end after fixes
+- 2026-04-08: Phase Install planned — MSI via cargo-wix to ease install on secondary machine
 
 ## Next Action
 
-Ship it. Tag a release:
-```powershell
-git tag v0.1.0
-git push origin main --tags
-```
+Run `/apes-execute Install` to start implementation
 
-The release workflow will build and upload artifacts automatically.
+Note: Task 1 has two prerequisite manual installs (WiX Toolset + cargo-wix)
+that the executing agent or operator needs to handle before the rest of the
+task can proceed. See wix/main.wxs hand-editing steps in PLAN.md Task 1.

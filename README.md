@@ -40,6 +40,44 @@ TUI is newly stabilized and benefits from user bug reports. See
 - Windows 10 1809+ or Windows 11 (for the ConPTY API)
 - Rust 1.75+ (install via [rustup](https://rustup.rs/))
 
+## Install from MSI (recommended)
+
+1. Download the latest `cmux-vX.Y.Z-windows-x64.msi` from the project's
+   [Releases page](https://github.com/OWNER/cmux/releases). (Replace `OWNER`
+   with the actual GitHub owner once this is published.)
+2. Double-click the MSI and accept the UAC prompt. The installer needs admin
+   rights to modify the system PATH.
+3. **SmartScreen warning:** cmux is not code-signed, so Windows Defender
+   SmartScreen will show "Windows protected your PC" on first run. Click
+   **More info** → **Run anyway**. This is expected and safe — the MSI is
+   built by the tagged GitHub Actions release workflow from the source in
+   this repo.
+4. After the installer finishes, **open a new PowerShell window** (existing
+   windows won't have the updated PATH).
+5. Verify:
+   ```powershell
+   cmux-daemon.exe --help
+   cmux-client.exe --help
+   ```
+
+The MSI installs to `C:\Program Files\cmux\` with this layout:
+
+```
+C:\Program Files\cmux\
+├── bin\
+│   ├── cmux-daemon.exe
+│   └── cmux-client.exe
+├── docs\
+│   ├── README.md
+│   └── cmux.example.toml
+└── scripts\
+    └── cmux-rpc.ps1
+```
+
+The `bin\` directory is added to system PATH. Uninstall via
+**Settings → Apps → cmux → Uninstall**. The PATH entry is removed cleanly
+on uninstall. New MSI versions upgrade the existing install in place.
+
 ## Install from source
 
 ```powershell
@@ -55,6 +93,20 @@ Two binaries are produced:
 - `target\release\cmux-client.exe` — CLI frontend and interactive TUI.
 
 Optionally copy both to a folder on your `PATH`.
+
+### Building the MSI locally
+
+If you want to build the installer yourself:
+
+```powershell
+# One-time setup:
+choco install wixtoolset          # or install WiX v3.14 from its GitHub releases
+cargo install cargo-wix --version "^0.3"
+
+# Build the MSI:
+cargo wix -p cmux-daemon --nocapture
+# Output: target\wix\cmux-0.1.0-x86_64.msi
+```
 
 ## Quickstart
 

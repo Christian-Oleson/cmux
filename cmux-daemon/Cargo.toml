@@ -2,6 +2,22 @@
 name = "cmux-daemon"
 version = "0.1.0"
 edition = "2021"
+authors = ["cmux contributors"]
+description = "Background daemon for cmux, a native Windows terminal multiplexer"
+license = "MIT OR Apache-2.0"
+
+# Metadata consumed by `cargo wix` to build the MSI installer. The
+# UpgradeCode GUID MUST be stable across versions so Windows treats new
+# MSIs as upgrades of the same product instead of parallel installs.
+# The path-guid is also persistent per-machine install directory.
+[package.metadata.wix]
+upgrade-guid = "3A7E2F8C-1D4B-4E9A-8F2C-9B5E7D1A6C4F"
+path-guid    = "F1B2C3D4-5E6F-7A8B-9C0D-1E2F3A4B5C6D"
+license      = false
+eula         = false
+name         = "cmux"
+product-name = "cmux - Windows terminal multiplexer"
+manufacturer = "cmux contributors"
 
 [lib]
 name = "cmux_daemon"

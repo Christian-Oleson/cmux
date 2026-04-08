@@ -26,6 +26,23 @@ jobs:
       - name: Build release
         run: cargo build --release --workspace
 
+      - name: Install cargo-wix
+        run: cargo install cargo-wix --version "^0.3" --locked
+
+      - name: Build MSI
+        shell: pwsh
+        run: |
+          # WiX v3 is pre-installed on windows-latest runners, but not on
+          # PATH. Add it so cargo-wix can find candle.exe and light.exe.
+          $wixDir = Get-ChildItem "C:\Program Files (x86)\WiX Toolset*" -Directory -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($wixDir) {
+            $env:PATH = "$($wixDir.FullName)\bin;$env:PATH"
+          } else {
+            # Fallback: install WiX 3.x via chocolatey
+            choco install wixtoolset -y --no-progress
+          }
+          cargo wix -p cmux-daemon --nocapture
+
       - name: Package artifacts
         shell: pwsh
         run: |
@@ -41,9 +58,18 @@ jobs:
           $zip = "cmux-$tag-windows-x64.zip"
           Compress-Archive -Path $stage/* -DestinationPath $zip -Force
 
+          # Copy the MSI to a predictable name for upload.
+          $msi = Get-ChildItem target/wix/*.msi | Select-Object -First 1
+          if (-not $msi) {
+            throw "No MSI found in target/wix/"
+          }
+          Copy-Item $msi.FullName "cmux-$tag-windows-x64.msi"
+
       - name: Upload release
         uses: softprops/action-gh-release@v2
         with:
-          files: cmux-*.zip
+          files: |
+            cmux-*.zip
+            cmux-*.msi
           draft: false
           generate_release_notes: true

@@ -1,503 +1,429 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- Dos Apes Super Agent Framework - Phase Plan -->
 <!-- Generated: 2026-04-08 -->
-<!-- Phase: 9 -->
+<!-- Phase: Install (post-v1.0 MSI installer) -->
 
 <plan>
   <metadata>
-    <phase>9</phase>
-    <name>CLI Polish, Error Handling &amp; Distribution</name>
-    <goal>Fix the interactive client's Windows input/rendering bugs, complete the CLI, add structured logging, ship a release build with a proper README</goal>
-    <deliverable>A shippable v1.0 binary where both the interactive client AND the JSON-RPC API are usable, with a README, CI, and release artifacts</deliverable>
+    <phase>Install</phase>
+    <name>MSI Installer via cargo-wix</name>
+    <goal>Produce a single .msi file that installs cmux-daemon.exe and cmux-client.exe system-wide on any Windows 10/11 machine, adds them to PATH, and ships as a release artifact from CI</goal>
+    <deliverable>A `cargo wix` command that produces target/wix/cmux-x.y.z-x86_64.msi locally, and a release workflow that uploads the same MSI alongside the existing zip on tag push</deliverable>
     <created>2026-04-08</created>
   </metadata>
 
   <context>
-    <dependencies>Phase 8 complete — all runtime features present, 168 tests, JSON-RPC API working end-to-end</dependencies>
+    <dependencies>
+      v1.0 already shipped on main. Release binaries (cmux-daemon.exe, cmux-client.exe)
+      already build cleanly from `cargo build --release --workspace`. README, example
+      config, and scripts/cmux-rpc.ps1 all exist and are referenced in the existing
+      release.yml workflow's zip packaging.
+    </dependencies>
     <affected_areas>
-      - cmux-client: MAJOR — fix Windows key input handling, add alternate screen buffer, handle reattach screen state
-      - cmux-daemon: send pane screen snapshots on attach (currently only sends workspace structure)
-      - cmux-daemon/src/main.rs: graceful shutdown, structured file logging
-      - cmux-client/src/main.rs: more CLI subcommands (detach, list-panes, list-windows, rename, display-message)
-      - .github/workflows/: CI + release workflows
-      - README.md: user-facing documentation
-      - cmux-client/src/terminal.rs: REMOVE the debug_key_log scaffolding added during Phase 8 debugging
+      - Root Cargo.toml: new [package.metadata.wix] section (attached to a bin crate)
+      - New directory: wix/ containing main.wxs (WiX source), License.rtf (shown in installer UI)
+      - cmux-daemon/Cargo.toml: cargo-wix reads metadata per-crate, needs [package.metadata.wix] here
+      - .github/workflows/release.yml: add cargo-wix install + msi build + upload step
+      - README.md: add "Install from MSI" section pointing at GitHub Releases
+      - .gitignore: ignore wix/*.wixobj wix/*.wixpdb target/wix/
     </affected_areas>
     <patterns_to_follow>
-      - The interactive client is the user-facing pain point from Phase 8 — take it seriously with a diagnostic-first approach
-      - JSON-RPC path is already tested and working — do not break it
-      - "Done" for Phase 9 means a user can run `cmux-daemon` + `cmux-client new -s main` in Windows Terminal/PowerShell and get a working multiplexer, OR use the JSON-RPC API from a script
-      - Deferred features (.msi installer, session persistence across daemon restarts, OSC notifications, prefix+: command mode) are NOT in scope for Phase 9 — they're post-v1.0 polish
+      - Use cargo-wix 0.3.x + WiX 3.x (pre-installed on GitHub Actions windows-latest)
+      - Single MSI packages BOTH binaries (cmux-daemon and cmux-client) — hand-edit
+        wix/main.wxs to add the second binary as an additional Component
+      - Per-machine install (Program Files) with system PATH modification — needs
+        admin, but that's acceptable for a "install on another machine" workflow
+      - Stable UpgradeCode GUID — pick once, never change, so 0.1.0 -> 0.2.0 upgrades
+        cleanly without leaving orphaned installs
+      - Also install README.md, cmux-config/example/cmux.toml, scripts/cmux-rpc.ps1
+        to the install directory for convenience
+      - No code signing (requires a cert) — users will see a SmartScreen warning on
+        first install and have to click "Run anyway". Document this as a caveat.
     </patterns_to_follow>
   </context>
 
   <tasks>
-    <task id="1" type="backend" complete="false">
-      <name>Diagnostic-first fix of the interactive client's Windows input + rendering</name>
+    <task id="1" type="setup" complete="false">
+      <name>Local MSI build: install cargo-wix, bootstrap wix/main.wxs, customize for two binaries + docs</name>
       <description>
-        The blocker from Phase 8 user testing: pressing Ctrl+B in the interactive
-        client did not trigger prefix mode, and on reattach the screen showed
-        stale/garbled content because the daemon doesn't replay screen state.
-        This task fixes all of it with a diagnostic-first approach: build a
-        minimal crossterm event dumper to identify what Windows is actually
-        sending, then fix the client based on real data.
+        Get `cargo wix` producing a working MSI on the local dev machine.
+        Most of the work is in wix/main.wxs — cargo-wix's init template only
+        includes one binary, so we hand-edit it to also package cmux-client.exe,
+        add PATH modification, and drop README + example config + RPC script
+        into the install directory.
       </description>
 
       <files>
         <create>
-          cmux-client/examples/key_dump.rs      (minimal standalone crossterm event logger)
+          wix/main.wxs                           (WiX XML, generated by `cargo wix init` then hand-edited)
+          wix/License.rtf                        (RTF license shown in installer UI; minimal MIT/Apache blurb)
         </create>
         <modify>
-          cmux-client/src/terminal.rs           (remove debug_key_log, add alternate screen buffer, improve input handling based on diagnostic findings)
-          cmux-client/src/pane_manager.rs       (remove #[allow(dead_code)] fallout, clean up any Phase 6-8 dead code)
-          cmux-daemon/src/session_manager.rs    (add read_pane_snapshot returning ScreenSnapshot bytes for replay)
-          cmux-daemon/src/server.rs             (on Attach, send pane snapshots as synthesized PaneOutput messages so client's local screen buffers get populated)
-          cmux-ipc/src/messages.rs              (optionally add PaneSnapshot message variant — OR just reuse PaneOutput with the raw VT stream)
-        </create>
-      </files>
-
-      <action>
-        **PART A — Diagnostic: build a standalone key dumper**
-
-        1. Create cmux-client/examples/key_dump.rs — a minimal standalone program
-           that enables raw mode + alternate screen + mouse capture, reads events
-           from crossterm's blocking `event::read()` loop, and prints each event
-           to stderr (which we pipe to a file). Exits on Esc.
-
-           ```rust
-           use crossterm::event::{self, Event, KeyCode};
-           use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
-           use std::io::Write;
-
-           fn main() -> anyhow::Result<()> {
-               enable_raw_mode()?;
-               crossterm::execute!(
-                   std::io::stdout(),
-                   crossterm::terminal::EnterAlternateScreen,
-                   crossterm::event::EnableMouseCapture,
-               )?;
-
-               let mut stderr = std::io::stderr().lock();
-               writeln!(stderr, "key_dump: press keys, Esc to exit")?;
-               stderr.flush()?;
-
-               loop {
-                   match event::read()? {
-                       Event::Key(k) => {
-                           writeln!(stderr, "KEY {:?}", k)?;
-                           stderr.flush()?;
-                           if k.code == KeyCode::Esc {
-                               break;
-                           }
-                       }
-                       Event::Mouse(m) => {
-                           writeln!(stderr, "MOUSE {:?}", m)?;
-                           stderr.flush()?;
-                       }
-                       Event::Resize(c, r) => {
-                           writeln!(stderr, "RESIZE {}x{}", c, r)?;
-                           stderr.flush()?;
-                       }
-                       other => {
-                           writeln!(stderr, "OTHER {:?}", other)?;
-                           stderr.flush()?;
-                       }
-                   }
-               }
-
-               disable_raw_mode()?;
-               crossterm::execute!(
-                   std::io::stdout(),
-                   crossterm::event::DisableMouseCapture,
-                   crossterm::terminal::LeaveAlternateScreen,
-               )?;
-               Ok(())
-           }
-           ```
-
-           User runs: `cargo run -p cmux-client --example key_dump 2&gt; key_dump.log`
-           Then presses Ctrl+B, %, arrow keys, Esc.
-           The log shows exactly what crossterm sees.
-
-        2. Based on the key_dump output, identify the actual bug. Likely candidates:
-           - crossterm feature flag missing (`bracketed-paste`, `event-stream`, `events`)
-           - Windows Terminal with `KeyboardEnhancementFlags` required
-           - EventStream (async) behaves differently from blocking event::read()
-           - Events are going via `KeyEventKind::Press` but the `kind` field is
-             `NoKind` on some Windows terminals (cargo/crossterm bug)
-           - The `key_event_to_bytes` fallthrough `_ => None` eating something
-
-        **PART B — Fix the identified bug**
-
-        3. Apply the fix. Possibilities:
-           - If EventStream doesn't deliver all events: switch to a blocking-thread-
-             with-mpsc pattern instead of crossterm's async EventStream
-           - If `kind` is `NoKind`: treat it the same as `Press`
-           - If enhancement flags are needed: call `PushKeyboardEnhancementFlags`
-             on enter, `PopKeyboardEnhancementFlags` on exit
-           - If case normalization wasn't enough: also normalize Shift+Char mappings
-
-        4. Remove the `debug_key_log` scaffolding and file path from terminal.rs.
-           (No debug file in production binary.)
-
-        **PART C — Alternate screen buffer**
-
-        5. In `RawModeGuard::enable()`, also enter the alternate screen buffer:
-           ```rust
-           crossterm::execute!(
-               std::io::stdout(),
-               crossterm::terminal::EnterAlternateScreen,
-           )?;
-           ```
-           
-        6. In `RawModeGuard::drop()`, leave the alternate screen buffer (it's
-           already there per current code — verify it runs). This hides all the
-           host terminal's pre-cmux content while cmux is running and restores
-           it cleanly on exit.
-
-        **PART D — Reattach screen state**
-
-        7. In `cmux-daemon/src/session_manager.rs`, add:
-           ```rust
-           /// Return the raw VT content that would reconstruct the current pane
-           /// screen state. Uses vt100's `contents_formatted()`.
-           pub async fn pane_snapshot_bytes(
-               &amp;self,
-               session_name: &amp;str,
-               pane_id: u32,
-           ) -&gt; Result&lt;Vec&lt;u8&gt;, CmuxError&gt; {
-               let sessions = self.sessions.lock().await;
-               let session = sessions.get(session_name)
-                   .ok_or_else(|| CmuxError::SessionNotFound(session_name.into()))?;
-               for ws in session.workspaces.values() {
-                   if let Some(pane) = ws.panes.get(&amp;pane_id) {
-                       let screen = pane.screen.lock().await;
-                       return Ok(screen.contents_formatted());
-                   }
-               }
-               Err(CmuxError::PaneNotFound(cmux_core::types::PaneId(pane_id)))
-           }
-           ```
-           Also expose `contents_formatted()` on cmux-core::screen::ScreenBuffer if
-           it doesn't exist — vt100::Screen has a method by that name that returns
-           the screen state as a byte string with escape sequences.
-
-        8. In `cmux-daemon/src/server.rs`, after sending `SessionState` on Attach
-           and on CreateSession, iterate over all panes in the session and send
-           one `ServerMessage::PaneOutput { pane_id, data: snapshot_bytes }` per
-           pane. This makes the client's local screen buffer populate immediately.
-
-        9. Sanity check: the client's existing `process_output` path will feed
-           those bytes into its per-pane ScreenBuffer, and render_full will then
-           draw the restored state. No new client code needed.
-      </action>
-
-      <verification>
-        <command>cargo build --workspace</command>
-        <command>cargo clippy --workspace</command>
-        <command>cargo test --workspace</command>
-        <manual>
-          1. Run: cargo run -p cmux-client --example key_dump 2&gt; key_dump.log
-             Press Ctrl+B, %, arrow keys, Esc. Inspect key_dump.log to verify
-             crossterm is actually delivering events.
-          2. Start daemon, start interactive client with `new -s main`.
-          3. Verify alternate screen buffer is entered (host terminal content
-             disappears, cmux takes over the whole window).
-          4. Press Ctrl+B, release, Shift+5 → pane should split vertically.
-          5. Type in each pane → only active pane receives input.
-          6. Ctrl+B d → detaches, host terminal restored.
-          7. cargo run -p cmux-client -- attach -t main → reattach shows
-             the actual pane content restored (not blank).
-        </manual>
-      </verification>
-
-      <done>
-        - key_dump.log shows clear evidence of what's happening on Windows
-        - Ctrl+B prefix detection works end-to-end
-        - Alternate screen buffer is used (host terminal preserved)
-        - Reattach restores visible pane content from daemon's ScreenBuffer
-        - debug_key_log scaffolding removed
-        - All existing tests still pass
-      </done>
-    </task>
-
-    <task id="2" type="backend" complete="false">
-      <name>CLI command completeness, daemon graceful shutdown, and file logging</name>
-      <description>
-        Round out the CLI with the commands listed in REQUIREMENTS.md Section 9.1
-        that aren't yet present. Add graceful shutdown handling to the daemon so
-        Ctrl+C cleanly kills all PTYs. Route daemon logs to %APPDATA%\cmux\cmux.log
-        via tracing-appender.
-      </description>
-
-      <files>
-        <modify>
-          cmux-client/src/main.rs               (add detach, list-panes, list-windows, rename-session, rename-window, send-keys, display-message, kill-server subcommands)
-          cmux-daemon/src/main.rs                (graceful shutdown via tokio::signal::ctrl_c(), file logging via tracing-appender)
-          cmux-daemon/src/session_manager.rs     (add shutdown_all() that kills every pane across all sessions cleanly)
-          cmux-daemon/Cargo.toml                (verify tracing-appender is already a dep — it was added in Phase 1)
+          cmux-daemon/Cargo.toml                 (add [package.metadata.wix] with UpgradeCode, LicenseSource, etc.)
+          .gitignore                             (ignore target/wix/, wix/*.wixobj, wix/*.wixpdb)
         </modify>
       </files>
 
       <action>
-        1. **CLI additions** in cmux-client/src/main.rs (via clap subcommands):
-           - `detach` — send Detach message from CLI context (rarely needed, usually done via keybinding, but per spec)
-           - `list-panes -t &lt;session&gt;` — call GetSessionState, pretty-print all pane IDs + workspace mapping
-           - `list-windows -t &lt;session&gt;` — same but workspaces only
-           - `rename-session -t &lt;old&gt; -n &lt;new&gt;` — for now, log "not implemented" and exit 1 (real rename needs daemon support, deferred)
-           - `send-keys -t &lt;session&gt; -p &lt;pane&gt; &lt;keys...&gt;` — create a one-shot connection, send PaneInput, disconnect
-           - `kill-server` — tells daemon to shut down (new ClientMessage::KillServer + daemon-side handler that triggers tokio::process::exit)
-           - `display-message &lt;msg&gt;` — deferred, log "not implemented"
+        **Prerequisites (manual, one-time per dev machine):**
 
-           The subcommands that work end-to-end: `list-panes`, `list-windows`, `send-keys`, `kill-server`.
-           The rest print a polite "not yet implemented" so the CLI is complete even if some commands are stubs.
+        1. Install WiX Toolset v3.11 from https://github.com/wixtoolset/wix3/releases
+           — or via chocolatey: `choco install wixtoolset`
+           Verify `candle.exe` and `light.exe` are on PATH.
 
-        2. **Graceful shutdown** in cmux-daemon/src/main.rs:
-           ```rust
-           let shutdown_sm = Arc::clone(&amp;session_manager);
-           tokio::select! {
-               r = interactive =&gt; { r??; }
-               r = rpc =&gt; { r??; }
-               _ = tokio::signal::ctrl_c() =&gt; {
-                   info!("Received Ctrl+C, shutting down");
-                   shutdown_sm.shutdown_all().await;
-               }
-           }
-           ```
-           Add `shutdown_all()` to SessionManager that iterates all sessions and
-           kills every ConPty before returning.
-
-        3. **File logging** in cmux-daemon/src/main.rs:
-           Use tracing-appender's rolling file to %APPDATA%\cmux\cmux.log:
-           ```rust
-           let log_dir = dirs::data_dir()
-               .map(|d| d.join("cmux"))
-               .unwrap_or_else(|| std::env::temp_dir().join("cmux"));
-           std::fs::create_dir_all(&amp;log_dir).ok();
-           let file_appender = tracing_appender::rolling::daily(&amp;log_dir, "cmux.log");
-           let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
-
-           tracing_subscriber::fmt()
-               .with_writer(non_blocking)
-               .with_env_filter(...)
-               .init();
-           ```
-           Keep the `_guard` alive in main's scope (drop flushes).
-
-           Note: add `dirs = "5"` to cmux-daemon's dependencies if not already there.
-
-        4. **Error handling improvements** in cmux-daemon/src/server.rs and
-           cmux-daemon/src/session_manager.rs:
-           - When a ConPty's reader task detects EOF (child exited), broadcast a
-             PaneOutput with a final "[process exited with code N]\r\n" line so
-             attached clients see it.
-             Requires ConPty::try_wait() to get exit code. Already exists.
-           - When a client pipe read fails, log the error and continue serving
-             (current behavior is to break the loop — that's correct).
-      </action>
-
-      <verification>
-        <command>cargo build --workspace</command>
-        <command>cargo clippy --workspace</command>
-        <command>cargo test --workspace</command>
-        <manual>
-          1. Start daemon, check %APPDATA%\cmux\cmux.log.YYYY-MM-DD is being written.
-          2. cargo run -p cmux-client -- new -s main → press Ctrl+B % to split
-          3. cargo run -p cmux-client -- list-panes -t main → shows 2 panes
-          4. cargo run -p cmux-client -- send-keys -t main -p 0 "echo test"
-          5. In daemon terminal: press Ctrl+C → daemon logs "shutting down",
-             kills all PTYs, exits cleanly (no orphaned powershell.exe processes
-             in Task Manager)
-        </manual>
-      </verification>
-
-      <done>
-        - CLI has all commands from REQUIREMENTS.md Section 9.1 (real or stubbed)
-        - Daemon logs to %APPDATA%\cmux\cmux.log with daily rotation
-        - Ctrl+C on daemon triggers graceful shutdown — no orphaned PTYs
-        - Child process exit codes displayed in panes
-        - All tests still pass
-      </done>
-    </task>
-
-    <task id="3" type="deploy" complete="false">
-      <name>README, GitHub Actions CI, and release artifacts</name>
-      <description>
-        Write the user-facing README with installation, quickstart, keybindings,
-        and JSON-RPC API reference. Set up GitHub Actions CI on windows-latest
-        running build/test/clippy/fmt. Add a release workflow that produces
-        standalone .exe artifacts.
-      </description>
-
-      <files>
-        <create>
-          README.md                              (top-level user-facing docs)
-          .github/workflows/ci.yml              (build, test, clippy, fmt on windows-latest)
-          .github/workflows/release.yml         (release build + upload .exe artifacts on tag push)
-        </create>
-        <modify>
-          Cargo.toml                             (add workspace.package metadata: authors, license, repository, description)
-        </modify>
-      </files>
-
-      <action>
-        1. **README.md** with the following sections:
-           - What is cmux (one paragraph)
-           - Status badge row (CI status, crate version — placeholder for now)
-           - Installation (build from source: `cargo build --release`)
-           - Quickstart: start daemon + client in two terminals, basic prefix
-             keys (the tmux-style two-step)
-           - Keybinding reference table
-           - Configuration example (link to cmux-config/example/cmux.toml)
-           - JSON-RPC API overview with a Python + PowerShell example
-             (reference scripts/cmux-rpc.ps1)
-           - Architecture diagram (ASCII art showing daemon/client/RPC pipe)
-           - Known limitations (list tech debt: scrollback search stubbed, 
-             no MSI installer yet, copy-mode scrollback nav, daemon session
-             persistence across restarts)
-           - Building + testing (cargo build/test/clippy commands)
-           - Contributing (link to REQUIREMENTS.md and .planning/ROADMAP.md)
-           - License (MIT or Apache-2.0 — match what's in Cargo.toml)
-
-        2. **.github/workflows/ci.yml**:
-           ```yaml
-           name: CI
-           on:
-             push:
-               branches: [main]
-             pull_request:
-               branches: [main]
-
-           jobs:
-             build:
-               runs-on: windows-latest
-               steps:
-                 - uses: actions/checkout@v4
-                 - uses: dtolnay/rust-toolchain@stable
-                   with:
-                     components: rustfmt, clippy
-                 - uses: Swatinem/rust-cache@v2
-                 - name: Check formatting
-                   run: cargo fmt --all --check
-                 - name: Clippy
-                   run: cargo clippy --workspace -- -D warnings
-                 - name: Build
-                   run: cargo build --workspace
-                 - name: Test
-                   run: cargo test --workspace
+        2. Install cargo-wix:
+           ```powershell
+           cargo install cargo-wix --version "^0.3"
            ```
 
-        3. **.github/workflows/release.yml**:
-           ```yaml
-           name: Release
-           on:
-             push:
-               tags: ['v*']
+        **Implementation steps:**
 
-           jobs:
-             release:
-               runs-on: windows-latest
-               steps:
-                 - uses: actions/checkout@v4
-                 - uses: dtolnay/rust-toolchain@stable
-                 - uses: Swatinem/rust-cache@v2
-                 - name: Build release
-                   run: cargo build --release --workspace
-                 - name: Package
-                   shell: pwsh
-                   run: |
-                     New-Item -ItemType Directory -Path release | Out-Null
-                     Copy-Item target/release/cmux-daemon.exe release/
-                     Copy-Item target/release/cmux-client.exe release/
-                     Copy-Item README.md release/
-                     Copy-Item cmux-config/example/cmux.toml release/cmux.example.toml
-                     Compress-Archive -Path release/* -DestinationPath cmux-$env:GITHUB_REF_NAME-windows-x64.zip
-                 - name: Upload release
-                   uses: softprops/action-gh-release@v2
-                   with:
-                     files: cmux-*.zip
-           ```
-
-        4. **Workspace metadata** in root Cargo.toml:
+        3. Add to cmux-daemon/Cargo.toml:
            ```toml
-           [workspace.package]
-           version = "0.1.0"
-           edition = "2021"
-           license = "MIT OR Apache-2.0"
-           repository = "https://github.com/USER/cmux"
-           description = "Native Windows terminal multiplexer"
+           [package.metadata.wix]
+           upgrade-guid = "3a7e2f8c-1d4b-4e9a-8f2c-9b5e7d1a6c4f"
+           path-guid    = "f1b2c3d4-5e6f-7a8b-9c0d-1e2f3a4b5c6d"
+           license      = false   # we supply our own License.rtf
+           eula         = false
+           name         = "cmux"
+           product-name = "cmux — Windows terminal multiplexer"
+           manufacturer = "cmux contributors"
            ```
-           And each crate's Cargo.toml picks these up with `*.workspace = true`.
-           (Optional — only if the user wants to publish to crates.io eventually.)
+           (Generate fresh GUIDs if you want; these are placeholders but they must
+           be stable across versions once committed. `cargo wix print` can help.)
 
-        5. Verify `cargo build --release` produces two exes in `target/release/`
-           that can run standalone (no cargo needed).
+        4. Bootstrap the wix directory:
+           ```powershell
+           cd C:\Projects\cmux
+           cargo wix init -p cmux-daemon
+           ```
+           This creates `wix/main.wxs` and `wix/License.rtf` templates. The default
+           template packages just cmux-daemon.exe.
+
+        5. Hand-edit `wix/main.wxs` to add cmux-client.exe + docs + scripts. The
+           cargo-wix generated template has a `<Feature>` and `<Component>` for the
+           binary. Add a second `<Component>` inside the same `<Feature>`:
+
+           ```xml
+           <Component Id="cmux_client_exe" Guid="*">
+             <File Id="cmux_client_exe_file"
+                   Name="cmux-client.exe"
+                   DiskId="1"
+                   Source="$(var.CargoTargetBinDir)\cmux-client.exe"
+                   KeyPath="yes"/>
+           </Component>
+
+           <Component Id="readme_md" Guid="*">
+             <File Id="readme_md_file"
+                   Name="README.md"
+                   DiskId="1"
+                   Source="README.md"
+                   KeyPath="yes"/>
+           </Component>
+
+           <Component Id="example_toml" Guid="*">
+             <File Id="example_toml_file"
+                   Name="cmux.example.toml"
+                   DiskId="1"
+                   Source="cmux-config\example\cmux.toml"
+                   KeyPath="yes"/>
+           </Component>
+
+           <Component Id="rpc_ps1" Guid="*">
+             <File Id="rpc_ps1_file"
+                   Name="cmux-rpc.ps1"
+                   DiskId="1"
+                   Source="scripts\cmux-rpc.ps1"
+                   KeyPath="yes"/>
+           </Component>
+           ```
+
+           Add matching `<ComponentRef Id="..."/>` lines inside `<Feature>` so they
+           actually ship.
+
+        6. Add PATH modification. Inside the `INSTALLFOLDER` Directory (or its
+           parent bin directory, depending on the generated template), add a
+           Component containing an `<Environment>` element:
+
+           ```xml
+           <Component Id="path_env" Guid="*" KeyPath="yes">
+             <Environment Id="PATH"
+                          Name="PATH"
+                          Value="[INSTALLFOLDER]"
+                          Permanent="no"
+                          Part="last"
+                          Action="set"
+                          System="yes"/>
+           </Component>
+           ```
+
+           Reference it with a `<ComponentRef Id="path_env"/>` under the Feature.
+
+        7. Edit `wix/License.rtf` to contain a minimal license blurb (MIT or
+           Apache-2.0 — pick one, match what's claimed in the README). WiX requires
+           the license file to be valid RTF. You can write it in WordPad or paste
+           a minimal RTF header + plain text. A one-liner is fine:
+
+           ```rtf
+           {\rtf1\ansi
+           cmux is dual-licensed under MIT or Apache-2.0. See README.md.
+           }
+           ```
+
+        8. Update `.gitignore`:
+           ```
+           /target
+           wix/*.wixobj
+           wix/*.wixpdb
+           ```
+           (Don't ignore wix/main.wxs or wix/License.rtf — those are source.)
+
+        9. Test the local build:
+           ```powershell
+           cargo wix -p cmux-daemon --nocapture
+           ```
+           Should produce `target/wix/cmux-0.1.0-x86_64.msi`. Watch for WiX errors
+           about missing files or bad paths and fix the Source= attributes.
+
+        10. **Install + test**: double-click the MSI, accept the UAC prompt, step
+            through the installer. After install, open a NEW PowerShell window
+            (the existing one won't have the updated PATH) and verify:
+            ```powershell
+            cmux-daemon.exe --help   # or just run it and Ctrl+C
+            cmux-client.exe ls
+            ```
+            Both should work from anywhere on the system.
+
+        11. **Test upgrade**: re-run `cargo wix`, install the same MSI on top of
+            itself. It should uninstall the previous version cleanly thanks to
+            the stable UpgradeCode.
+
+        12. **Test uninstall** via "Apps & features" → cmux → Uninstall. Verify
+            both exes are gone and PATH no longer contains the install directory.
       </action>
 
       <verification>
-        <command>cargo build --release --workspace</command>
-        <command>cargo test --workspace</command>
+        <command>cargo wix -p cmux-daemon</command>
         <manual>
-          1. README renders correctly on GitHub preview
-          2. target/release/cmux-daemon.exe runs standalone
-          3. target/release/cmux-client.exe runs standalone
-          4. Push a test tag: git tag v0.0.1-test &amp;&amp; git push --tags
-             — verify release workflow triggers in GitHub Actions (if repo pushed)
+          1. target/wix/cmux-0.1.0-x86_64.msi exists and is 3-5 MB
+          2. Installer runs, shows UAC prompt, completes without error
+          3. New PowerShell window has cmux-daemon.exe and cmux-client.exe on PATH
+          4. Both binaries run from any directory
+          5. Uninstall via Control Panel removes everything
+          6. Re-install on top of existing install upgrades cleanly (no "already installed" error)
         </manual>
       </verification>
 
       <done>
-        - README.md exists and accurately describes the project
-        - CI workflow passes on windows-latest
-        - Release workflow builds standalone .exe artifacts
-        - Workspace Cargo.toml has shared metadata
-        - `cargo build --release` produces working standalone binaries
+        - `cargo wix -p cmux-daemon` produces a working MSI locally
+        - MSI installs both binaries + README + example config + RPC script
+        - System PATH is updated so both exes are callable from any shell
+        - Uninstall cleanly removes everything including the PATH entry
+        - Upgrade (install-over-existing) works without manual cleanup
+        - wix/main.wxs and wix/License.rtf committed to repo
+        - .gitignore updated for build artifacts
+      </done>
+    </task>
+
+    <task id="2" type="deploy" complete="false">
+      <name>Wire MSI into release.yml workflow and document install in README</name>
+      <description>
+        Extend the existing release workflow so `git tag v*` produces an MSI
+        artifact uploaded to the GitHub Release alongside the existing zip.
+        Add an "Install from MSI" section to README.md pointing at the Releases
+        page.
+      </description>
+
+      <files>
+        <modify>
+          .github/workflows/release.yml          (install cargo-wix, build MSI, upload as release asset)
+          README.md                              (add Install from MSI section under existing install docs)
+        </modify>
+      </files>
+
+      <action>
+        1. Edit `.github/workflows/release.yml`. After the existing cargo-build
+           step and before the Package Artifacts step, add:
+
+           ```yaml
+           - name: Install cargo-wix
+             run: cargo install cargo-wix --version "^0.3" --locked
+
+           - name: Build MSI
+             run: cargo wix -p cmux-daemon --nocapture
+           ```
+
+           GitHub's `windows-latest` runner has WiX 3.x pre-installed, so no
+           separate WiX install step is needed. (Verify this — if WiX isn't on
+           PATH, add `choco install wixtoolset -y` before the cargo-wix install.)
+
+        2. Update the Package Artifacts step to also copy the MSI into the
+           release staging directory:
+
+           ```yaml
+           - name: Package artifacts
+             shell: pwsh
+             run: |
+               $tag = "${{ github.ref_name }}"
+               $stage = "release-stage"
+               New-Item -ItemType Directory -Path $stage -Force | Out-Null
+               Copy-Item target/release/cmux-daemon.exe $stage/
+               Copy-Item target/release/cmux-client.exe $stage/
+               Copy-Item README.md $stage/
+               Copy-Item REQUIREMENTS.md $stage/
+               Copy-Item cmux-config/example/cmux.toml $stage/cmux.example.toml
+               Copy-Item scripts/cmux-rpc.ps1 $stage/cmux-rpc.ps1
+               $zip = "cmux-$tag-windows-x64.zip"
+               Compress-Archive -Path $stage/* -DestinationPath $zip -Force
+
+               # Also copy the MSI to a predictable name for upload
+               $msi = Get-ChildItem target/wix/*.msi | Select-Object -First 1
+               Copy-Item $msi "cmux-$tag-windows-x64.msi"
+           ```
+
+        3. Update the `Upload release` step's `files:` list to include the MSI:
+
+           ```yaml
+           - name: Upload release
+             uses: softprops/action-gh-release@v2
+             with:
+               files: |
+                 cmux-*.zip
+                 cmux-*.msi
+               draft: false
+               generate_release_notes: true
+           ```
+
+        4. Update README.md. Find the existing "Install from source" section.
+           Add a new section ABOVE it titled "Install from MSI":
+
+           ```markdown
+           ## Install from MSI (recommended for end users)
+
+           1. Download the latest `cmux-vX.Y.Z-windows-x64.msi` from the
+              [Releases page](https://github.com/USER/cmux/releases).
+           2. Double-click to run. Accept the UAC prompt (the installer needs
+              admin rights to modify system PATH).
+           3. Windows SmartScreen may warn that the installer is from an
+              unknown publisher. cmux is not code-signed — click **More info**
+              → **Run anyway**.
+           4. After install, open a **new** PowerShell window (existing windows
+              won't have the updated PATH).
+           5. Run `cmux-daemon` in one window and `cmux-client new -s main`
+              in another.
+
+           The MSI installs to `C:\Program Files\cmux\` and adds that directory
+           to system PATH. Uninstall via **Apps & features** → cmux.
+
+           ## Install from source
+           ... (existing content stays)
+           ```
+
+        5. After committing, tag a test release locally (don't push yet) and
+           verify the workflow syntax:
+           ```powershell
+           gh workflow view release.yml
+           ```
+           Or use `act` if installed, or just push the branch and check the
+           Actions tab in the GitHub UI.
+      </action>
+
+      <verification>
+        <command>cargo wix -p cmux-daemon --nocapture</command>
+        <manual>
+          1. Push a throwaway tag: `git tag v0.0.1-test-msi &amp;&amp; git push origin v0.0.1-test-msi`
+          2. Watch the release workflow in GitHub Actions
+          3. Verify a Release is created with BOTH .zip and .msi artifacts attached
+          4. Download the MSI, install on a second Windows machine, verify cmux works
+          5. Delete the test tag + release afterward:
+             `git push origin :refs/tags/v0.0.1-test-msi` then delete the release via GH UI
+          6. README Install from MSI section renders correctly on GitHub preview
+        </manual>
+      </verification>
+
+      <done>
+        - release.yml installs cargo-wix and builds an MSI
+        - Tag push uploads both .zip and .msi to the GitHub Release
+        - README has an Install from MSI section with SmartScreen caveat
+        - Local `cargo wix` still works independently of CI
       </done>
     </task>
   </tasks>
 
   <phase_verification>
     <commands>
-      <command>cargo build --workspace</command>
+      <command>cargo wix -p cmux-daemon --nocapture</command>
       <command>cargo build --release --workspace</command>
-      <command>cargo clippy --workspace -- -D warnings</command>
-      <command>cargo fmt --all --check</command>
       <command>cargo test --workspace</command>
     </commands>
     <manual>
-      1. Fresh install: cargo clean, cargo build --release
-      2. Start daemon: .\target\release\cmux-daemon.exe
-      3. Start client: .\target\release\cmux-client.exe new -s main
-      4. Interactive client actually works: Ctrl+B %, arrow navigate, Ctrl+B d
-      5. JSON-RPC path still works via scripts/cmux-rpc.ps1
-      6. Daemon Ctrl+C is clean (no orphaned powershell.exe)
-      7. Check %APPDATA%\cmux\cmux.log.YYYY-MM-DD has logs
-      8. README is accurate and matches what actually works
+      1. Local MSI build works and installs a usable cmux on the dev machine
+      2. Uninstall + reinstall leaves the machine clean
+      3. Upgrade (new version on top of old) works without orphaned files
+      4. CI release workflow produces both zip and msi artifacts
+      5. MSI installed on a SECOND Windows machine and used successfully (the
+         whole reason for this phase)
     </manual>
   </phase_verification>
 
   <completion_criteria>
-    <criterion>All 3 tasks marked complete</criterion>
-    <criterion>cargo build/clippy/fmt/test all pass</criterion>
-    <criterion>Interactive client works end-to-end (Ctrl+B prefix, split, navigate, detach/reattach)</criterion>
-    <criterion>JSON-RPC path still works (Phase 8 regression check)</criterion>
-    <criterion>Release build produces standalone .exe</criterion>
-    <criterion>README covers installation, quickstart, keybindings, and JSON-RPC API</criterion>
-    <criterion>CI workflow runs on windows-latest</criterion>
-    <criterion>Daemon graceful shutdown on Ctrl+C</criterion>
-    <criterion>No debug_key_log scaffolding left in production code</criterion>
+    <criterion>All 2 tasks marked complete</criterion>
+    <criterion>Local MSI build produces a working installer</criterion>
+    <criterion>MSI installs cmux-daemon + cmux-client + docs + RPC script to Program Files</criterion>
+    <criterion>System PATH is updated during install, cleaned up on uninstall</criterion>
+    <criterion>Upgrade-over-existing works without manual cleanup</criterion>
+    <criterion>CI release workflow produces and uploads the MSI on tag push</criterion>
+    <criterion>README documents the MSI install path with the SmartScreen caveat</criterion>
+    <criterion>Stable UpgradeCode GUID committed so future releases upgrade cleanly</criterion>
+    <criterion>Tested on a second Windows machine end-to-end</criterion>
   </completion_criteria>
 
   <deferred>
-    Explicitly NOT in Phase 9 scope (post-v1.0):
-    - MSI installer / WinGet / Scoop / Chocolatey packages
-    - Session state persistence across daemon restarts
-    - OSC 9/99/777 toast notifications
-    - Interactive command mode (prefix + :)
-    - rename-session / rename-window real implementations
-    - Scrollback search in copy mode
-    - Scrollback history navigation in copy mode (vt100::Screen scroll_up)
-    - JSON-RPC event streaming subscriptions
-    - Cross-platform Linux/macOS support
+    Not in this phase's scope (maybe never):
+    - Code signing the MSI with a real certificate (costs ~$200/yr, eliminates SmartScreen warning)
+    - Per-user (non-admin) install option
+    - Start Menu shortcuts to cmux-daemon
+    - Windows Service registration for cmux-daemon
+    - WinGet manifest submission (can ride on top of this MSI once it exists)
+    - Scoop manifest (pairs better with the .zip than the MSI)
+    - Chocolatey package (similar — zip-based is simpler)
   </deferred>
+
+  <risks>
+    1. **cargo-wix + workspace friction.** cargo-wix expects to operate on a
+       single bin crate. Running from the workspace root may need `-p cmux-daemon`
+       on every invocation. If `cargo wix init` outputs files in the wrong
+       location, may need to run it from `cmux-daemon/` directory instead of
+       repo root. Task 1 step 4 calls this out.
+
+    2. **WiX 3 vs WiX 4/5.** cargo-wix 0.3.x uses WiX 3. cargo-wix 0.4.x uses
+       WiX 4/5. GitHub Actions windows-latest has WiX 3 pre-installed, so
+       sticking with cargo-wix 0.3.x is the path of least resistance. If you
+       want to use WiX 4 (newer, fewer dependencies), add `choco install wixtoolset5`
+       to the workflow.
+
+    3. **GUID stability.** If the UpgradeCode in [package.metadata.wix] is
+       changed between releases, Windows treats the new MSI as a completely
+       different product and doesn't uninstall the old one. The plan sets the
+       GUID once and commits it. Resist temptation to regenerate it.
+
+    4. **Admin requirement for PATH.** Per-machine install needs UAC. For a
+       "install on another machine easily" use case this is fine, but note
+       that running `msiexec /i cmux.msi /quiet` in CI or automation needs
+       elevation. Per-user install without PATH is possible but doesn't meet
+       the original goal (needing to `cd` to the install dir to run the exes
+       defeats the purpose).
+
+    5. **SmartScreen warning.** Unsigned MSI will trigger Windows Defender
+       SmartScreen: "Windows protected your PC." Users have to click
+       "More info" → "Run anyway." Documented in README. Only fix is code
+       signing, which costs money and is deferred.
+
+    6. **File paths on CI vs local.** The Source= attributes in main.wxs use
+       relative paths like `target\release\cmux-client.exe` or
+       `$(var.CargoTargetBinDir)\cmux-client.exe`. The cargo-wix documentation
+       for the right form varies by version — if the initial build fails with
+       "file not found," check what variable cargo-wix exposes in the current
+       version and adjust.
+  </risks>
 </plan>

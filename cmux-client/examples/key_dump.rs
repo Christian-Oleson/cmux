@@ -66,7 +66,10 @@ fn main() -> anyhow::Result<()> {
 
     println!();
     println!("========================================");
-    println!(" Log written to: {}", std::env::current_dir()?.join("key_dump.log").display());
+    println!(
+        " Log written to: {}",
+        std::env::current_dir()?.join("key_dump.log").display()
+    );
     println!("========================================");
 
     result
