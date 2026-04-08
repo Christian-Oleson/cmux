@@ -18,6 +18,9 @@ pub const DEFAULT_ROWS: u16 = 24;
 /// Named pipe path for IPC.
 pub const PIPE_NAME: &str = r"\\.\pipe\cmux";
 
+/// Named pipe path for JSON-RPC API.
+pub const RPC_PIPE_NAME: &str = r"\\.\pipe\cmux-rpc";
+
 /// Default escape time (prefix key timeout) in milliseconds.
 pub const DEFAULT_ESCAPE_TIME_MS: u64 = 500;
 

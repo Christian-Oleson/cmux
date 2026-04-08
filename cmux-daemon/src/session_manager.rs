@@ -1,13 +1,24 @@
 use cmux_core::error::CmuxError;
 use cmux_core::pty::{ConPty, ConPtyConfig};
+use cmux_core::screen::ScreenBuffer;
 use cmux_ipc::messages::{ServerMessage, SessionInfo, WorkspaceInfo};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex};
 use tracing::{debug, error, info};
 
+/// Summary of a pane across all workspaces in a session.
+#[derive(Debug, Clone)]
+pub struct PaneSummary {
+    pub pane_id: u32,
+    pub workspace_id: u32,
+    pub cols: u16,
+    pub rows: u16,
+}
+
 struct ManagedPane {
     pty: Arc<ConPty>,
+    screen: Arc<Mutex<ScreenBuffer>>,
 }
 
 struct ManagedWorkspace {
@@ -46,7 +57,12 @@ impl SessionManager {
         self.output_tx.subscribe()
     }
 
-    fn spawn_pane_reader(pty: Arc<ConPty>, pane_id: u32, tx: broadcast::Sender<ServerMessage>) {
+    fn spawn_pane_reader(
+        pty: Arc<ConPty>,
+        screen: Arc<Mutex<ScreenBuffer>>,
+        pane_id: u32,
+        tx: broadcast::Sender<ServerMessage>,
+    ) {
         tokio::spawn(async move {
             let mut buf = [0u8; 8192];
             loop {
@@ -56,6 +72,12 @@ impl SessionManager {
                         break;
                     }
                     Ok(n) => {
+                        // Feed into the per-pane screen buffer so read_pane_output
+                        // can return the current rendered screen content.
+                        {
+                            let mut s = screen.lock().await;
+                            s.process(&buf[..n]);
+                        }
                         let msg = ServerMessage::PaneOutput {
                             pane_id,
                             data: buf[..n].to_vec(),
@@ -79,8 +101,18 @@ impl SessionManager {
         };
         let pty =
             Arc::new(ConPty::spawn(&config).map_err(|e| CmuxError::Pty(format!("spawn: {e}")))?);
-        Self::spawn_pane_reader(Arc::clone(&pty), pane_id, self.output_tx.clone());
-        Ok(ManagedPane { pty })
+        let screen = Arc::new(Mutex::new(ScreenBuffer::new(
+            rows,
+            cols,
+            cmux_config::defaults::DEFAULT_SCROLLBACK,
+        )));
+        Self::spawn_pane_reader(
+            Arc::clone(&pty),
+            Arc::clone(&screen),
+            pane_id,
+            self.output_tx.clone(),
+        );
+        Ok(ManagedPane { pty, screen })
     }
 
     pub async fn create_session(
@@ -335,5 +367,91 @@ impl SessionManager {
             }
         }
         Err(CmuxError::PaneNotFound(cmux_core::types::PaneId(pane_id)))
+    }
+
+    /// Read the current screen text content of a pane (one string per row,
+    /// trailing whitespace trimmed).
+    pub async fn read_pane_output(
+        &self,
+        session_name: &str,
+        pane_id: u32,
+    ) -> Result<Vec<String>, CmuxError> {
+        let sessions = self.sessions.lock().await;
+        let session = sessions
+            .get(session_name)
+            .ok_or_else(|| CmuxError::SessionNotFound(session_name.into()))?;
+        for ws in session.workspaces.values() {
+            if let Some(pane) = ws.panes.get(&pane_id) {
+                let screen = pane.screen.lock().await;
+                let rows = screen.rows();
+                let cols = screen.cols();
+                let mut lines = Vec::with_capacity(rows as usize);
+                for r in 0..rows {
+                    let mut line = String::new();
+                    for c in 0..cols {
+                        if let Some(cell) = screen.cell_at(r, c) {
+                            if cell.contents.is_empty() {
+                                line.push(' ');
+                            } else {
+                                line.push_str(&cell.contents);
+                            }
+                        }
+                    }
+                    lines.push(line.trim_end().to_string());
+                }
+                return Ok(lines);
+            }
+        }
+        Err(CmuxError::PaneNotFound(cmux_core::types::PaneId(pane_id)))
+    }
+
+    /// Get a summary of all panes across all workspaces in a session.
+    pub async fn list_all_panes(&self, session_name: &str) -> Result<Vec<PaneSummary>, CmuxError> {
+        let sessions = self.sessions.lock().await;
+        let session = sessions
+            .get(session_name)
+            .ok_or_else(|| CmuxError::SessionNotFound(session_name.into()))?;
+        let mut result = Vec::new();
+        for ws in session.workspaces.values() {
+            for (pane_id, pane) in &ws.panes {
+                let screen = pane.screen.lock().await;
+                result.push(PaneSummary {
+                    pane_id: *pane_id,
+                    workspace_id: ws.id,
+                    cols: screen.cols(),
+                    rows: screen.rows(),
+                });
+            }
+        }
+        result.sort_by_key(|p| p.pane_id);
+        Ok(result)
+    }
+
+    /// List workspaces for a session as (id, name, pane_ids) tuples, sorted by id.
+    pub async fn list_workspaces(
+        &self,
+        session_name: &str,
+    ) -> Result<Vec<(u32, String, Vec<u32>)>, CmuxError> {
+        let sessions = self.sessions.lock().await;
+        let session = sessions
+            .get(session_name)
+            .ok_or_else(|| CmuxError::SessionNotFound(session_name.into()))?;
+        let mut result: Vec<_> = session
+            .workspaces
+            .values()
+            .map(|ws| {
+                let mut pane_ids: Vec<u32> = ws.panes.keys().copied().collect();
+                pane_ids.sort();
+                (ws.id, ws.name.clone(), pane_ids)
+            })
+            .collect();
+        result.sort_by_key(|(id, _, _)| *id);
+        Ok(result)
+    }
+}
+
+impl Default for SessionManager {
+    fn default() -> Self {
+        Self::new()
     }
 }

@@ -1,385 +1,511 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- Dos Apes Super Agent Framework - Phase Plan -->
 <!-- Generated: 2026-04-07 -->
-<!-- Phase: 7 -->
+<!-- Phase: 8 -->
 
 <plan>
   <metadata>
-    <phase>7</phase>
-    <name>Configuration &amp; Themes</name>
-    <goal>TOML-based configuration with themes, customizable keybindings, and runtime options</goal>
-    <deliverable>Users can configure prefix key, shell, scrollback, theme colors, and custom keybindings via ~/.cmux.toml</deliverable>
+    <phase>8</phase>
+    <name>JSON-RPC API &amp; Agent Integration</name>
+    <goal>Full programmatic JSON-RPC 2.0 API for AI agents to control cmux sessions, workspaces, and panes</goal>
+    <deliverable>AI agents can connect to a dedicated Named Pipe, invoke JSON-RPC methods to create sessions, send text/keys, read pane output, and subscribe to events</deliverable>
     <created>2026-04-07</created>
   </metadata>
 
   <context>
-    <dependencies>Phase 6 complete — keybinding system, renderer with hardcoded colors, scrollback, all runtime features</dependencies>
+    <dependencies>Phase 7 complete — JsonRpcRequest/Response types exist (cmux-ipc/src/protocol.rs), session manager has workspace/pane operations, transport layer for length-prefixed framing</dependencies>
     <affected_areas>
-      - cmux-config: expand from defaults.rs to full Config + Theme types with TOML loading
-      - cmux-client/src/renderer.rs: replace hardcoded border/status colors with theme values
-      - cmux-client/src/terminal.rs: load Config at startup, build KeyTable from config
-      - cmux-core/src/keybinding.rs: add From&lt;ConfigBindings&gt; or builder for KeyTable
-      - cmux-client/src/main.rs: load config before running terminal
+      - cmux-ipc/src/protocol.rs: already has JSON-RPC 2.0 types (unused since Phase 1) — now wire them up
+      - cmux-daemon/src/jsonrpc.rs (new): method dispatcher, handlers for session.*/workspace.*/surface.*/notify.*
+      - cmux-daemon/src/rpc_server.rs (new): dedicated Named Pipe listener for JSON-RPC clients
+      - cmux-daemon/src/main.rs: start both the interactive server AND the RPC server in parallel
+      - cmux-daemon/src/session_manager.rs: may need new methods for read_output (screen content), send_key
+      - cmux-config/src/defaults.rs: add RPC pipe name constant
     </affected_areas>
     <patterns_to_follow>
-      - Config loaded once at startup from %APPDATA%\cmux\config.toml or ~/.cmux.toml
-      - Missing config file = use defaults (don't error)
-      - Built-in themes hardcoded as named presets (Catppuccin, Dracula, Nord, Solarized)
-      - User themes override built-ins
-      - Hardcoded colors at renderer.rs:307 (DarkGrey) and 311 (Green/Bold) become theme.border_inactive / theme.border_active
-      - Config &lt;-&gt; KeyTable conversion: parse string keys ("C-b", "%") into InputKey
+      - Separate pipe for RPC (\\.\pipe\cmux-rpc) — keeps interactive client protocol untouched
+      - JSON-RPC 2.0 compliant: method, params, id, result/error
+      - Method names use dot notation: "session.create", "surface.send_text"
+      - Errors use standard JSON-RPC error codes (-32600 invalid request, -32601 method not found, -32602 invalid params, -32000+ server errors)
+      - Notifications (request with no id field) used for event streams — agent subscribes, daemon pushes
+      - Transport: existing length-prefixed JSON framing from cmux-ipc/src/transport.rs
+      - Concurrent clients: each pipe connection spawns a tokio task, dispatcher uses Arc&lt;SessionManager&gt; + Mutex already in place
     </patterns_to_follow>
   </context>
 
   <tasks>
     <task id="1" type="backend" complete="false">
-      <name>Config types, TOML loading, built-in themes, key string parsing</name>
+      <name>JSON-RPC dispatcher with session, workspace, surface, and notify methods</name>
       <description>
-        Build out cmux-config with a Config struct, Theme struct, and built-in
-        theme presets. Implement TOML loading from standard paths. Add string-
-        to-InputKey parsing so config files can specify keybindings as "C-b",
-        "%", "Up", etc.
+        Create a method dispatcher that maps JsonRpcRequest to SessionManager operations
+        and returns structured JsonRpcResponse. Implement all core methods: session.*
+        (create/list/kill), workspace.* (create/close/switch/list), surface.* (split/
+        send_text/send_key/read_output/resize/close/list), and notify.send.
       </description>
 
       <files>
         <create>
-          cmux-config/src/config.rs            (Config, Options, Bindings structs)
-          cmux-config/src/theme.rs             (Theme struct, built-in presets)
-          cmux-config/src/parse.rs             (key string parsing: "C-b" -> InputKey)
+          cmux-daemon/src/jsonrpc.rs            (method dispatcher + all method handlers)
         </create>
         <modify>
-          cmux-config/Cargo.toml               (add cmux-core dep, dirs crate)
-          cmux-config/src/lib.rs               (re-export Config, Theme, load functions)
-          cmux-core/src/keybinding.rs           (make Color/InputKey accessible from config)
+          cmux-daemon/src/session_manager.rs    (add read_output + list_all_panes methods)
+          cmux-daemon/src/main.rs                (add mod jsonrpc)
+          cmux-config/src/defaults.rs            (add RPC_PIPE_NAME constant)
         </modify>
       </files>
 
       <action>
-        1. Update cmux-config/Cargo.toml dependencies:
-           ```toml
-           [dependencies]
-           serde = { workspace = true }
-           toml = { workspace = true }
-           thiserror = { workspace = true }
-           cmux-core = { workspace = true }
-           dirs = "5"
-           ```
-
-        2. Create cmux-config/src/theme.rs:
+        1. Add to cmux-config/src/defaults.rs:
            ```rust
-           use cmux_core::screen::Color;
-           use serde::{Serialize, Deserialize};
-
-           #[derive(Debug, Clone, Serialize, Deserialize)]
-           pub struct Theme {
-               pub name: String,
-               // Status bar colors
-               pub status_fg: Color,
-               pub status_bg: Color,
-               // Pane border colors
-               pub border_inactive: Color,
-               pub border_active: Color,
-               // Status bar workspace highlight
-               pub workspace_active_fg: Color,
-               pub workspace_active_bg: Color,
-           }
-
-           impl Default for Theme {
-               fn default() -> Self {
-                   Self::dracula()
-               }
-           }
-
-           impl Theme {
-               pub fn dracula() -> Self { ... }   // dark purple, pink, cyan
-               pub fn catppuccin() -> Self { ... } // pastel mocha
-               pub fn nord() -> Self { ... }       // arctic blue/grey
-               pub fn solarized_dark() -> Self { ... }
-               pub fn by_name(name: &amp;str) -> Option&lt;Theme&gt; {
-                   match name.to_lowercase().as_str() {
-                       "dracula" =&gt; Some(Self::dracula()),
-                       "catppuccin" =&gt; Some(Self::catppuccin()),
-                       "nord" =&gt; Some(Self::nord()),
-                       "solarized" | "solarized_dark" =&gt; Some(Self::solarized_dark()),
-                       _ =&gt; None,
-                   }
-               }
-           }
+           /// Named pipe path for JSON-RPC API.
+           pub const RPC_PIPE_NAME: &amp;str = r"\\.\pipe\cmux-rpc";
            ```
 
-           Color values for each theme (Color::Rgb(r,g,b)):
-           - Dracula: bg=#282a36, fg=#f8f8f2, active=#bd93f9 (purple), inactive=#44475a
-           - Catppuccin: bg=#1e1e2e, fg=#cdd6f4, active=#f5c2e7 (pink), inactive=#45475a
-           - Nord: bg=#2e3440, fg=#d8dee9, active=#88c0d0 (frost), inactive=#4c566a
-           - Solarized dark: bg=#073642, fg=#839496, active=#268bd2, inactive=#586e75
+        2. Add to cmux-daemon/src/session_manager.rs:
+           - Need a way to get screen content for a pane. We don't currently track
+             a ScreenBuffer in the daemon — PTYs just stream bytes to clients.
+             For Phase 8, we add a lightweight ScreenBuffer per pane in the daemon:
+             
+             Modify ManagedPane to hold an Arc&lt;Mutex&lt;ScreenBuffer&gt;&gt;:
+             ```rust
+             struct ManagedPane {
+                 pty: Arc&lt;ConPty&gt;,
+                 screen: Arc&lt;tokio::sync::Mutex&lt;cmux_core::screen::ScreenBuffer&gt;&gt;,
+             }
+             ```
+           
+           - Update spawn_pane_reader to feed bytes into the screen buffer:
+             ```rust
+             fn spawn_pane_reader(
+                 pty: Arc&lt;ConPty&gt;,
+                 screen: Arc&lt;Mutex&lt;ScreenBuffer&gt;&gt;,
+                 pane_id: u32,
+                 tx: broadcast::Sender&lt;ServerMessage&gt;,
+             ) {
+                 // After reading bytes, also call screen.lock().await.process(&amp;buf[..n])
+             }
+             ```
 
-        3. Create cmux-config/src/parse.rs — parse key strings into InputKey:
+           - Add: pub async fn read_pane_output(&amp;self, session, pane_id, lines: Option&lt;usize&gt;) -> Result&lt;Vec&lt;String&gt;&gt;
+             Returns text content of the pane's current screen (one String per row).
+
+           - Add: pub async fn list_all_panes(&amp;self, session) -> Result&lt;Vec&lt;PaneSummary&gt;&gt;
+             Where PaneSummary has pane_id, workspace_id, cols, rows.
+
+        3. Create cmux-daemon/src/jsonrpc.rs:
+
            ```rust
-           use cmux_core::keybinding::{InputKey, KeyCode};
+           use cmux_ipc::protocol::{JsonRpcRequest, JsonRpcResponse};
+           use crate::session_manager::SessionManager;
+           use serde_json::{json, Value};
+           use std::sync::Arc;
 
-           /// Parse a tmux-style key string into an InputKey.
-           /// Examples: "C-b", "%", "Up", "F1", "C-A-x"
-           pub fn parse_key(s: &amp;str) -> Result&lt;InputKey, String&gt; {
-               // Split on '-'; last segment is the key, others are modifiers
-               // Modifiers: C = Ctrl, A/M = Alt/Meta, S = Shift
-               // Single char = KeyCode::Char(c)
-               // "Up", "Down", "Left", "Right" = KeyCode::Up etc
-               // "F1".."F12" = KeyCode::F(n)
-               // "Enter", "Tab", "Esc", "Backspace", "Space" = KeyCode::*
+           /// Dispatch a JSON-RPC request to the appropriate handler.
+           pub async fn dispatch(
+               req: JsonRpcRequest,
+               session_manager: &amp;Arc&lt;SessionManager&gt;,
+               context: &amp;mut RpcContext,
+           ) -> JsonRpcResponse {
+               match req.method.as_str() {
+                   // Session methods
+                   "session.create" => session_create(req, session_manager).await,
+                   "session.list" => session_list(req, session_manager).await,
+                   "session.kill" => session_kill(req, session_manager).await,
+
+                   // Workspace methods
+                   "workspace.create" => workspace_create(req, session_manager, context).await,
+                   "workspace.list" => workspace_list(req, session_manager, context).await,
+                   "workspace.close" => workspace_close(req, session_manager, context).await,
+                   "workspace.switch" => workspace_switch(req, session_manager, context).await,
+
+                   // Surface (pane) methods
+                   "surface.list" => surface_list(req, session_manager, context).await,
+                   "surface.split" => surface_split(req, session_manager, context).await,
+                   "surface.send_text" => surface_send_text(req, session_manager, context).await,
+                   "surface.send_key" => surface_send_key(req, session_manager, context).await,
+                   "surface.read_output" => surface_read_output(req, session_manager, context).await,
+                   "surface.close" => surface_close(req, session_manager, context).await,
+
+                   // Notification methods
+                   "notify.send" => notify_send(req, session_manager).await,
+
+                   // Unknown method
+                   _ => JsonRpcResponse::error(req.id, -32601, format!("Method not found: {}", req.method)),
+               }
+           }
+
+           /// Per-connection context (tracks which session the RPC client is bound to).
+           pub struct RpcContext {
+               pub session: Option&lt;String&gt;,
+           }
+
+           impl RpcContext {
+               pub fn new() -&gt; Self {
+                   Self { session: None }
+               }
            }
            ```
-           Add unit tests: "C-b", "%", "Up", "F5", "C-A-x", "Enter", "Space", invalid
 
-        4. Create cmux-config/src/config.rs:
+        4. Implement each handler. Example for session.create:
            ```rust
-           use crate::theme::Theme;
-           use serde::{Serialize, Deserialize};
-           use std::collections::HashMap;
-           use std::path::Path;
-
-           #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-           #[serde(default)]
-           pub struct Config {
-               pub options: Options,
-               pub theme: ThemeConfig,
-               pub bindings: HashMap&lt;String, String&gt;, // key string -> action name
-           }
-
-           #[derive(Debug, Clone, Serialize, Deserialize)]
-           #[serde(default)]
-           pub struct Options {
-               pub prefix: String,           // "C-b"
-               pub shell: Option&lt;String&gt;,    // None = default
-               pub scrollback: usize,        // 10_000
-               pub mouse: bool,              // true
-               pub escape_time_ms: u64,      // 500
-               pub base_index: u32,          // 0
-           }
-
-           impl Default for Options {
-               fn default() -> Self {
-                   Self {
-                       prefix: "C-b".into(),
-                       shell: None,
-                       scrollback: 10_000,
-                       mouse: true,
-                       escape_time_ms: 500,
-                       base_index: 0,
-                   }
-               }
-           }
-
-           #[derive(Debug, Clone, Serialize, Deserialize)]
-           #[serde(default)]
-           pub struct ThemeConfig {
-               pub name: String,             // "dracula"
-               #[serde(flatten)]
-               pub overrides: HashMap&lt;String, String&gt;, // hex color overrides
-           }
-
-           impl Default for ThemeConfig {
-               fn default() -> Self {
-                   Self { name: "dracula".into(), overrides: HashMap::new() }
-               }
-           }
-
-           impl Config {
-               /// Load config from standard paths.
-               /// Tries: %APPDATA%\cmux\config.toml then ~/.cmux.toml
-               /// Returns Config::default() if neither exists.
-               pub fn load() -> Self {
-                   if let Some(path) = Self::config_path() {
-                       if let Ok(text) = std::fs::read_to_string(&amp;path) {
-                           if let Ok(cfg) = toml::from_str::&lt;Config&gt;(&amp;text) {
-                               return cfg;
-                           }
-                       }
-                   }
-                   Config::default()
-               }
-
-               pub fn load_from(path: &amp;Path) -> Result&lt;Self, ConfigError&gt; { ... }
-
-               pub fn config_path() -> Option&lt;PathBuf&gt; {
-                   // Try %APPDATA%\cmux\config.toml first
-                   if let Some(data) = dirs::data_dir() {
-                       let p = data.join("cmux").join("config.toml");
-                       if p.exists() { return Some(p); }
-                   }
-                   // Fall back to ~/.cmux.toml
-                   if let Some(home) = dirs::home_dir() {
-                       let p = home.join(".cmux.toml");
-                       if p.exists() { return Some(p); }
-                   }
-                   None
-               }
-
-               /// Resolve the active Theme (built-in + overrides).
-               pub fn resolve_theme(&amp;self) -> Theme {
-                   let mut theme = Theme::by_name(&amp;self.theme.name).unwrap_or_default();
-                   // Apply hex overrides if any
-                   theme
+           async fn session_create(
+               req: JsonRpcRequest,
+               sm: &amp;Arc&lt;SessionManager&gt;,
+           ) -> JsonRpcResponse {
+               let name = match req.params.get("name").and_then(|v| v.as_str()) {
+                   Some(n) =&gt; n.to_string(),
+                   None =&gt; return JsonRpcResponse::error(req.id, -32602, "missing 'name' param"),
+               };
+               let shell = req.params.get("shell").and_then(|v| v.as_str()).map(String::from);
+               match sm.create_session(name, shell).await {
+                   Ok((id, name)) =&gt; JsonRpcResponse::success(
+                       req.id,
+                       json!({"session_id": id, "name": name}),
+                   ),
+                   Err(e) =&gt; JsonRpcResponse::error(req.id, -32000, e.to_string()),
                }
            }
            ```
 
-           Add ConfigError enum (thiserror).
+           For session.create, also set context.session = Some(name) so subsequent
+           workspace/surface calls default to this session (or require a "session" param).
 
-        5. Update cmux-config/src/lib.rs:
+           For surface.send_text: send raw bytes to pane:
            ```rust
-           pub mod config;
-           pub mod defaults;
-           pub mod parse;
-           pub mod theme;
-
-           pub use config::{Config, ConfigError, Options, ThemeConfig};
-           pub use theme::Theme;
+           async fn surface_send_text(
+               req: JsonRpcRequest,
+               sm: &amp;Arc&lt;SessionManager&gt;,
+               ctx: &amp;RpcContext,
+           ) -&gt; JsonRpcResponse {
+               let session = match get_session(&amp;req, ctx) {
+                   Ok(s) =&gt; s,
+                   Err(e) =&gt; return JsonRpcResponse::error(req.id, -32602, e),
+               };
+               let pane_id = match req.params.get("pane_id").and_then(|v| v.as_u64()) {
+                   Some(id) =&gt; id as u32,
+                   None =&gt; return JsonRpcResponse::error(req.id, -32602, "missing 'pane_id'"),
+               };
+               let text = match req.params.get("text").and_then(|v| v.as_str()) {
+                   Some(t) =&gt; t,
+                   None =&gt; return JsonRpcResponse::error(req.id, -32602, "missing 'text'"),
+               };
+               match sm.send_input(&amp;session, pane_id, text.as_bytes()).await {
+                   Ok(()) =&gt; JsonRpcResponse::success(req.id, json!({"ok": true})),
+                   Err(e) =&gt; JsonRpcResponse::error(req.id, -32000, e.to_string()),
+               }
+           }
            ```
 
-        6. Make Color in cmux-core/src/screen.rs Serialize/Deserialize (already is per Phase 2).
+           For surface.send_key: translate key names ("Enter", "Tab", "C-c") to bytes
+           using cmux_config::parse::parse_key + key_to_bytes helper, or accept
+           literal bytes in a "bytes" array param.
 
-        7. Unit tests in each module:
-           - parse: parse_key for "C-b", "%", "Up", "F1", "Enter", "C-A-x", invalid
-           - theme: each preset has expected colors, by_name lookup
-           - config: load_from with valid TOML, defaults when file missing, default Options
+           For surface.read_output: get screen text content:
+           ```rust
+           // Returns: { "lines": ["row0", "row1", ...], "cursor_row": N, "cursor_col": M }
+           ```
+
+        5. Helper functions:
+           - get_session(req, ctx) -> Result&lt;String, String&gt;: check req.params["session"] or fall back to ctx.session
+           - parse_pane_id(req) -> Result&lt;u32, String&gt;
+
+        6. Unit tests (inline #[cfg(test)]):
+           - Unknown method returns -32601 error
+           - session.create without "name" param returns -32602 error
+           - session.create with valid params calls session_manager.create_session
+             (use a mock or just instantiate a real SessionManager since it's Arc-based)
+           - surface.send_text validates params
       </action>
 
       <verification>
-        <command>cargo build -p cmux-config</command>
-        <command>cargo test -p cmux-config</command>
-        <command>cargo clippy -p cmux-config</command>
+        <command>cargo build --workspace</command>
+        <command>cargo test -p cmux-daemon</command>
+        <command>cargo clippy --workspace</command>
       </verification>
 
       <done>
-        - Config struct with Options + ThemeConfig + bindings parses from TOML
-        - 4 built-in themes (dracula, catppuccin, nord, solarized_dark) with concrete colors
-        - parse_key handles tmux-style key strings
-        - Config::load() reads from %APPDATA%\cmux\config.toml or ~/.cmux.toml
-        - Config::default() works with no file
-        - 10+ unit tests passing
+        - jsonrpc.rs exists with dispatch function + all method handlers
+        - session.* / workspace.* / surface.* / notify.* methods implemented
+        - SessionManager has read_pane_output + list_all_panes + screen buffer per pane
+        - Unit tests verify dispatch routing and error handling
+        - All existing tests still pass
       </done>
     </task>
 
-    <task id="2" type="integration" complete="false">
-      <name>Wire config and theme into renderer, terminal, and key table</name>
+    <task id="2" type="backend" complete="false">
+      <name>Dedicated RPC pipe listener with concurrent clients and event subscriptions</name>
       <description>
-        Replace hardcoded colors in renderer.rs with theme-driven values. Load
-        Config in main.rs and pass it through to terminal/renderer. Build KeyTable
-        from config bindings (with fallback to default_tmux for unconfigured keys).
+        Create a second Named Pipe listener (\\.\pipe\cmux-rpc) dedicated to
+        JSON-RPC clients. Each connection gets its own tokio task that reads
+        requests, dispatches them, writes responses. Supports event subscriptions
+        via JSON-RPC notifications for pane output streaming.
       </description>
 
       <files>
+        <create>
+          cmux-daemon/src/rpc_server.rs         (RPC pipe listener + per-client handler)
+        </create>
         <modify>
-          cmux-client/src/renderer.rs           (use Theme for border/status colors)
-          cmux-client/src/terminal.rs           (accept Config, build themed renderer)
-          cmux-client/src/main.rs               (Config::load() at startup, pass to run_terminal)
-          cmux-core/src/keybinding.rs           (KeyTable::from_config for custom bindings)
+          cmux-daemon/src/main.rs                (spawn both server and rpc_server)
         </modify>
       </files>
 
       <action>
-        1. Update cmux-core/src/keybinding.rs:
-           - Add a constructor that takes a default table and applies overrides:
-             ```rust
-             impl KeyTable {
-                 pub fn with_overrides(
-                     base: KeyTable,
-                     prefix_str: &amp;str,
-                     bindings: &amp;HashMap&lt;String, String&gt;,
-                     parse_key: impl Fn(&amp;str) -> Result&lt;InputKey, String&gt;,
-                     parse_action: impl Fn(&amp;str) -> Option&lt;Action&gt;,
-                 ) -> KeyTable { ... }
-             }
-             ```
-             OR keep it simpler: just add a from_config function in cmux-config that
-             builds a KeyTable using KeyTable::default_tmux() and bind/unbind as needed.
+        1. Create cmux-daemon/src/rpc_server.rs:
 
-           - Add a parse_action helper somewhere (cmux-config/src/parse.rs):
-             ```rust
-             pub fn parse_action(s: &amp;str) -> Option&lt;Action&gt; {
-                 match s {
-                     "split-vertical" => Some(Action::SplitVertical),
-                     "split-horizontal" => Some(Action::SplitHorizontal),
-                     "close-pane" => Some(Action::ClosePane),
-                     // ... etc
-                     _ => None,
-                 }
-             }
-             ```
+           ```rust
+           use crate::jsonrpc::{dispatch, RpcContext};
+           use crate::session_manager::SessionManager;
+           use cmux_ipc::protocol::{JsonRpcRequest, JsonRpcResponse};
+           use cmux_ipc::transport;
+           use std::sync::Arc;
+           use tokio::net::windows::named_pipe::{PipeMode, ServerOptions};
+           use tracing::{debug, error, info};
 
-           - Add fn in cmux-config: build_key_table(config: &amp;Config) -> KeyTable that:
-             1. Starts from KeyTable::default_tmux()
-             2. Parses config.options.prefix to set prefix_key
-             3. Iterates config.bindings: parse key string + action name, call bind()
+           pub async fn run_rpc_server(
+               pipe_name: &amp;str,
+               session_manager: Arc&lt;SessionManager&gt;,
+           ) -&gt; anyhow::Result&lt;()&gt; {
+               info!(pipe = pipe_name, "Starting JSON-RPC server");
 
-        2. Update cmux-client/src/renderer.rs:
-           - Add Theme parameter to Renderer:
-             ```rust
-             pub struct Renderer {
-                 prev_snapshots: HashMap&lt;PaneId, ScreenSnapshot&gt;,
-                 theme: Theme,
-             }
+               let mut server = ServerOptions::new()
+                   .first_pipe_instance(true)
+                   .pipe_mode(PipeMode::Byte)
+                   .create(pipe_name)?;
 
-             impl Renderer {
-                 pub fn new() -> Self { Self::with_theme(Theme::default()) }
-                 pub fn with_theme(theme: Theme) -> Self { ... }
-             }
-             ```
-           - Replace hardcoded `style::Color::DarkGrey` (border_inactive) with `to_crossterm_color(self.theme.border_inactive)`
-           - Replace hardcoded `style::Color::Green` + Bold (border_active) with theme.border_active
-           - Replace hardcoded status bar style with theme.status_fg / theme.status_bg
-           - Use theme.workspace_active_fg/bg for the active workspace marker
+               loop {
+                   server.connect().await?;
+                   info!("RPC client connected");
 
-        3. Update cmux-client/src/terminal.rs:
-           - Accept Config parameter in run_terminal
-           - Build Renderer with theme: Renderer::with_theme(config.resolve_theme())
-           - Build KeyTable from config: cmux_config::build_key_table(&amp;config)
-           - Pass mouse setting from config to enable/disable mouse capture
+                   let sm = Arc::clone(&amp;session_manager);
+                   let (reader, writer) = tokio::io::split(server);
 
-        4. Update cmux-client/src/main.rs:
-           - At start of main: let config = Config::load();
-           - Pass config to run_terminal calls
+                   tokio::spawn(async move {
+                       if let Err(e) = handle_rpc_client(reader, writer, sm).await {
+                           error!(error = %e, "RPC client handler error");
+                       }
+                       info!("RPC client disconnected");
+                   });
 
-        5. Verification: existing keybindings should still work since defaults are inherited.
+                   server = ServerOptions::new()
+                       .pipe_mode(PipeMode::Byte)
+                       .create(pipe_name)?;
+               }
+           }
 
-        6. Manual config file for testing:
-           Create example at cmux-config/example/cmux.toml
-           ```toml
-           [options]
-           prefix = "C-a"   # use Ctrl+A instead of Ctrl+B
-           shell = "powershell.exe"
-           scrollback = 50000
-           mouse = true
-           
-           [theme]
-           name = "nord"
+           async fn handle_rpc_client&lt;R, W&gt;(
+               mut reader: R,
+               mut writer: W,
+               session_manager: Arc&lt;SessionManager&gt;,
+           ) -&gt; anyhow::Result&lt;()&gt;
+           where
+               R: tokio::io::AsyncRead + Unpin + Send + 'static,
+               W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+           {
+               let mut context = RpcContext::new();
 
-           [bindings]
-           "C-r" = "create-workspace"
+               // Channel for writer task to serialize responses
+               let (resp_tx, mut resp_rx) = tokio::sync::mpsc::channel::&lt;JsonRpcResponse&gt;(256);
+
+               // Writer task
+               let writer_task = tokio::spawn(async move {
+                   while let Some(resp) = resp_rx.recv().await {
+                       if let Err(e) = transport::write_message(&amp;mut writer, &amp;resp).await {
+                           debug!(error = %e, "RPC write error");
+                           break;
+                       }
+                   }
+               });
+
+               // Reader loop
+               loop {
+                   let req: Option&lt;JsonRpcRequest&gt; =
+                       match transport::read_message(&amp;mut reader).await {
+                           Ok(r) =&gt; r,
+                           Err(e) =&gt; {
+                               debug!(error = %e, "RPC read error");
+                               break;
+                           }
+                       };
+
+                   let req = match req {
+                       Some(r) =&gt; r,
+                       None =&gt; break,
+                   };
+
+                   // Dispatch (may be slow for some methods)
+                   let resp = dispatch(req, &amp;session_manager, &amp;mut context).await;
+                   if resp_tx.send(resp).await.is_err() {
+                       break;
+                   }
+               }
+
+               drop(resp_tx);
+               let _ = writer_task.await;
+               Ok(())
+           }
            ```
+
+        2. Event subscriptions (basic):
+           - When a client calls method "surface.subscribe", the handler:
+             * Subscribes to session_manager.subscribe_output()
+             * Spawns a task that forwards broadcast messages as JSON-RPC notifications
+             * Notification format: JsonRpcRequest with id=0 (per JSON-RPC 2.0 notification spec)
+             * Or use a different envelope — for simplicity, we'll use JsonRpcResponse without
+               a matching id (id = 0 = notification indicator in our protocol)
+           
+           Actually, to keep things simpler for Phase 8: skip the streaming subscription.
+           Agents can poll surface.read_output. Note this as deferred tech debt.
+           The plan says "SHOULD support event subscriptions" (REQ-API-005) — we'll
+           mark this as out of scope for Phase 8 MVP.
+
+        3. Update cmux-daemon/src/main.rs to run both servers:
+           ```rust
+           mod jsonrpc;
+           mod rpc_server;
+           mod server;
+           mod session_manager;
+
+           use session_manager::SessionManager;
+           use std::sync::Arc;
+           use tracing::info;
+
+           #[tokio::main]
+           async fn main() -&gt; anyhow::Result&lt;()&gt; {
+               tracing_subscriber::fmt().with_env_filter(...).init();
+
+               let session_manager = Arc::new(SessionManager::new());
+               let pipe_name = cmux_config::defaults::PIPE_NAME;
+               let rpc_pipe_name = cmux_config::defaults::RPC_PIPE_NAME;
+
+               info!("cmux daemon starting");
+
+               // Run both servers concurrently
+               let sm1 = Arc::clone(&amp;session_manager);
+               let sm2 = Arc::clone(&amp;session_manager);
+               
+               let interactive = tokio::spawn(async move {
+                   server::run_server(pipe_name, sm1).await
+               });
+               let rpc = tokio::spawn(async move {
+                   rpc_server::run_rpc_server(rpc_pipe_name, sm2).await
+               });
+
+               // Exit if either fails
+               tokio::select! {
+                   r = interactive =&gt; { r??; }
+                   r = rpc =&gt; { r??; }
+               }
+
+               Ok(())
+           }
+           ```
+
+        4. Note in README / docs: JSON-RPC clients connect to \\.\pipe\cmux-rpc
+           (separate from interactive \\.\pipe\cmux).
       </action>
 
       <verification>
         <command>cargo build --workspace</command>
         <command>cargo clippy --workspace</command>
-        <command>cargo fmt --all --check</command>
         <command>cargo test --workspace</command>
         <manual>
-          1. With no config file: cmux works with default tmux keys + dracula theme
-          2. Create config.toml with prefix = "C-a": Ctrl+A becomes prefix
-          3. Set theme = "nord": colors change visibly (border, status bar)
-          4. Add custom binding: takes effect
+          1. Start daemon: cargo run -p cmux-daemon
+          2. Verify log shows both "Starting server" and "Starting JSON-RPC server"
+          3. Connect to \\.\pipe\cmux-rpc manually (e.g. PowerShell named pipe client)
+          4. Send JSON-RPC session.create request
+          5. Verify response matches format
         </manual>
       </verification>
 
       <done>
-        - Renderer uses Theme colors instead of hardcoded Green/DarkGrey
-        - Config::load() called at startup
-        - Custom prefix key from config is honored
-        - Theme name from config selects built-in theme
-        - Custom keybindings from [bindings] section work
-        - Default behavior unchanged when no config file present
-        - All tests pass
+        - Daemon runs both interactive server and RPC server concurrently
+        - JSON-RPC clients connect to \\.\pipe\cmux-rpc independently of interactive clients
+        - Multiple concurrent RPC clients can connect without blocking each other
+        - Each client has its own RpcContext for session binding
+        - Clean error handling on disconnect
+      </done>
+    </task>
+
+    <task id="3" type="test" complete="false">
+      <name>JSON-RPC integration tests — round-trip methods over Named Pipe</name>
+      <description>
+        Write integration tests that spin up the RPC server, connect a client,
+        and exercise the full JSON-RPC API: create session, split pane, send text,
+        read output, list panes, kill session.
+      </description>
+
+      <files>
+        <create>
+          cmux-daemon/tests/rpc_integration.rs  (full JSON-RPC round-trip tests)
+        </create>
+      </files>
+
+      <action>
+        1. Create cmux-daemon/tests/rpc_integration.rs with a helper that starts
+           the RPC server on a unique pipe name for each test:
+
+           ```rust
+           use cmux_ipc::protocol::{JsonRpcRequest, JsonRpcResponse};
+           use cmux_ipc::transport;
+           use serde_json::json;
+           use tokio::net::windows::named_pipe::{ClientOptions, PipeMode, ServerOptions};
+           use tokio::time::{timeout, Duration};
+
+           fn test_pipe_name(suffix: &amp;str) -&gt; String {
+               format!(r"\\.\pipe\cmux_rpc_test_{}", suffix)
+           }
+
+           async fn start_test_server(pipe_name: String) -&gt; tokio::task::JoinHandle&lt;()&gt; {
+               // Create SessionManager, spawn run_rpc_server in background
+           }
+           ```
+
+        2. Test cases:
+           - test_session_create_via_rpc: Connect, send session.create, verify response
+             has session_id and name.
+           - test_method_not_found: Send unknown method, verify -32601 error.
+           - test_missing_params: Send session.create without name, verify -32602 error.
+           - test_session_list: Create 2 sessions, call session.list, verify both returned.
+           - test_surface_send_text: Create session, send "echo hi" via surface.send_text,
+             call surface.read_output, verify "hi" appears in output.
+           - test_kill_session: Create + kill, verify success.
+
+        Note: These tests require the daemon internals (SessionManager + rpc_server)
+        to be accessible as a library. Since cmux-daemon is a bin crate currently,
+        we may need to add a [lib] target or make the modules pub within the bin.
+        
+        Simplest approach: add `pub mod rpc_server; pub mod jsonrpc; pub mod session_manager;`
+        declarations. Integration tests in cmux-daemon/tests/ can access the bin's
+        modules via the `use cmux_daemon::*` path IF cmux-daemon has a lib target.
+        
+        Alternative: add a minimal [lib] section to cmux-daemon/Cargo.toml:
+        ```toml
+        [lib]
+        name = "cmux_daemon"
+        path = "src/lib.rs"
+        ```
+        And create src/lib.rs that re-exports the modules:
+        ```rust
+        pub mod jsonrpc;
+        pub mod rpc_server;
+        pub mod session_manager;
+        ```
+        Then src/main.rs uses `use cmux_daemon::{...}`.
+
+        Go with the lib-target approach.
+      </action>
+
+      <verification>
+        <command>cargo test -p cmux-daemon --test rpc_integration</command>
+        <command>cargo test --workspace</command>
+      </verification>
+
+      <done>
+        - 6+ integration tests exercising the JSON-RPC API end-to-end over Named Pipes
+        - Tests cover: session lifecycle, error cases, surface send/read
+        - All existing tests still pass
+        - Total test count grows by at least 6
       </done>
     </task>
   </tasks>
@@ -392,19 +518,20 @@
       <command>cargo test --workspace</command>
     </commands>
     <manual>
-      1. No config = default behavior (Ctrl+B prefix, dracula theme)
-      2. Custom config.toml with different prefix = honored
-      3. Theme switch visibly changes border/status colors
-      4. Custom binding works
+      1. Start daemon, verify both servers log startup
+      2. Write a quick Python/PowerShell client to connect to \\.\pipe\cmux-rpc
+      3. Send session.create + surface.send_text + surface.read_output
+      4. Verify round-trip works
     </manual>
   </phase_verification>
 
   <completion_criteria>
-    <criterion>All 2 tasks marked complete</criterion>
+    <criterion>All 3 tasks marked complete</criterion>
     <criterion>cargo build/clippy/fmt/test all pass</criterion>
-    <criterion>TOML config loaded from standard paths</criterion>
-    <criterion>4 built-in themes (Dracula, Catppuccin, Nord, Solarized)</criterion>
-    <criterion>Renderer uses theme colors (no hardcoded DarkGrey/Green)</criterion>
-    <criterion>Custom prefix key and bindings work from config</criterion>
+    <criterion>JSON-RPC server runs on \\.\pipe\cmux-rpc alongside interactive server</criterion>
+    <criterion>All core methods work: session/workspace/surface/notify</criterion>
+    <criterion>surface.read_output returns actual screen text content</criterion>
+    <criterion>Integration tests verify round-trip over Named Pipe</criterion>
+    <criterion>Concurrent RPC clients supported</criterion>
   </completion_criteria>
 </plan>
