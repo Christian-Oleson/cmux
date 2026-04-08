@@ -1,4 +1,5 @@
 use crate::copy_mode::CopyModeState;
+use cmux_config::Theme;
 use cmux_core::layout::LayoutEngine;
 use cmux_core::screen::{CellInfo, Color, ScreenBuffer, ScreenSnapshot};
 use cmux_core::types::PaneId;
@@ -11,16 +12,25 @@ use std::io::Write;
 
 /// Render the status bar at the given row.
 ///
-/// Format: inverse colors, `[session] 0:name | 1:name* | 2:name`
-/// The active workspace is marked with `*`.
+/// Format: theme-colored, `[session] 0:name | 1:name | 2:name` where the
+/// active workspace is highlighted using `theme.workspace_active_*`.
 pub fn render_status_bar<W: Write>(
     out: &mut W,
     session_name: &str,
     workspaces: &[(u32, String, bool)],
     terminal_cols: u16,
     row: u16,
+    theme: &Theme,
 ) -> std::io::Result<()> {
-    render_status_bar_with_mode(out, session_name, workspaces, None, terminal_cols, row)
+    render_status_bar_with_mode(
+        out,
+        session_name,
+        workspaces,
+        None,
+        terminal_cols,
+        row,
+        theme,
+    )
 }
 
 /// Render the status bar with an optional right-aligned mode indicator
@@ -32,55 +42,89 @@ pub fn render_status_bar_with_mode<W: Write>(
     mode_indicator: Option<&str>,
     terminal_cols: u16,
     row: u16,
+    theme: &Theme,
 ) -> std::io::Result<()> {
-    // Build the status text
-    let mut text = format!("[{}] ", session_name);
-    for (i, (id, name, is_active)) in workspaces.iter().enumerate() {
-        if i > 0 {
-            text.push_str(" | ");
-        }
-        if *is_active {
-            text.push_str(&format!("{}:{}*", id, name));
-        } else {
-            text.push_str(&format!("{}:{}", id, name));
-        }
-    }
-
     let cols = terminal_cols as usize;
 
-    // Compose the final bar: left-aligned workspaces, right-aligned mode.
-    if let Some(mode) = mode_indicator {
-        let mode_text = format!("[{}]", mode);
-        if text.len() + mode_text.len() < cols {
-            let padding = cols - text.len() - mode_text.len();
-            text.push_str(&" ".repeat(padding));
-            text.push_str(&mode_text);
-        } else if text.len() < cols {
-            text.push_str(&" ".repeat(cols - text.len()));
-        } else {
-            text.truncate(cols);
-        }
-    } else if text.len() < cols {
-        text.push_str(&" ".repeat(cols - text.len()));
-    } else if text.len() > cols {
-        text.truncate(cols);
-    }
+    // Base status bar style (used for prefix and non-active workspace chunks).
+    let base_style = ContentStyle {
+        foreground_color: Some(to_crossterm_color(theme.status_fg)),
+        background_color: Some(to_crossterm_color(theme.status_bg)),
+        ..ContentStyle::default()
+    };
 
-    // Render with inverse attribute
-    out.queue(cursor::MoveTo(0, row))?;
-    let bar_style = ContentStyle {
+    // Highlight style for the currently-active workspace segment.
+    let active_style = ContentStyle {
+        foreground_color: Some(to_crossterm_color(theme.workspace_active_fg)),
+        background_color: Some(to_crossterm_color(theme.workspace_active_bg)),
         attributes: {
             let mut a = Attributes::default();
-            a.set(Attribute::Reverse);
+            a.set(Attribute::Bold);
             a
         },
         ..ContentStyle::default()
     };
-    out.queue(style::PrintStyledContent(StyledContent::new(
-        bar_style, &text,
-    )))?;
 
-    // Reset attributes after the bar
+    // Build styled segments left-to-right. Each entry is (style, text).
+    let mut segments: Vec<(ContentStyle, String)> = Vec::new();
+
+    // Session prefix: "[name] "
+    segments.push((base_style, format!("[{}] ", session_name)));
+
+    for (i, (id, name, is_active)) in workspaces.iter().enumerate() {
+        if i > 0 {
+            segments.push((base_style, " | ".to_string()));
+        }
+        let label = format!("{}:{}", id, name);
+        if *is_active {
+            // Pad with a single space on either side so the highlight is
+            // visually distinct against the base status bar background.
+            segments.push((active_style, format!(" {} ", label)));
+        } else {
+            segments.push((base_style, label));
+        }
+    }
+
+    // Compute total rendered length (in display chars — we only use ASCII
+    // in the status bar so .len() on UTF-8 bytes matches here).
+    let total_len: usize = segments.iter().map(|(_, s)| s.len()).sum();
+
+    let mode_text = mode_indicator.map(|m| format!("[{}]", m));
+    let mode_len = mode_text.as_ref().map(|m| m.len()).unwrap_or(0);
+
+    // Pad middle with spaces (in base_style) so mode indicator is right-aligned.
+    if let Some(mode) = mode_text {
+        if total_len + mode_len < cols {
+            let padding = cols - total_len - mode_len;
+            segments.push((base_style, " ".repeat(padding)));
+            segments.push((base_style, mode));
+        } else if total_len < cols {
+            segments.push((base_style, " ".repeat(cols - total_len)));
+        }
+    } else if total_len < cols {
+        segments.push((base_style, " ".repeat(cols - total_len)));
+    }
+
+    // Emit each segment. Truncate-as-we-go to respect `cols`.
+    out.queue(cursor::MoveTo(0, row))?;
+    let mut remaining = cols;
+    for (style_, text) in segments {
+        if remaining == 0 {
+            break;
+        }
+        let to_print: String = if text.len() > remaining {
+            text.chars().take(remaining).collect()
+        } else {
+            text
+        };
+        let printed_len = to_print.len();
+        out.queue(style::PrintStyledContent(StyledContent::new(
+            style_, to_print,
+        )))?;
+        remaining = remaining.saturating_sub(printed_len);
+    }
+
+    // Reset attributes after the bar.
     out.queue(style::ResetColor)?;
 
     Ok(())
@@ -158,13 +202,27 @@ fn emit_cell_highlighted<W: Write>(
 
 pub struct Renderer {
     prev_snapshots: HashMap<PaneId, ScreenSnapshot>,
+    theme: Theme,
 }
 
 impl Renderer {
+    #[allow(dead_code)]
     pub fn new() -> Self {
+        Self::with_theme(Theme::default())
+    }
+
+    pub fn with_theme(theme: Theme) -> Self {
         Self {
             prev_snapshots: HashMap::new(),
+            theme,
         }
+    }
+
+    /// Access the theme this renderer is using. Callers that render the
+    /// status bar outside of the renderer still need to pass theme colors
+    /// in, so expose it here.
+    pub fn theme(&self) -> &Theme {
+        &self.theme
     }
 
     /// Full redraw of all panes at their layout positions with borders.
@@ -304,11 +362,11 @@ impl Renderer {
         let active_rect = rects.iter().find(|r| r.pane_id == active_pane);
 
         let border_style = ContentStyle {
-            foreground_color: Some(style::Color::DarkGrey),
+            foreground_color: Some(to_crossterm_color(self.theme.border_inactive)),
             ..ContentStyle::default()
         };
         let active_border_style = ContentStyle {
-            foreground_color: Some(style::Color::Green),
+            foreground_color: Some(to_crossterm_color(self.theme.border_active)),
             attributes: {
                 let mut a = Attributes::default();
                 a.set(Attribute::Bold);

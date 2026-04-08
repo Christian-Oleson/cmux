@@ -1,0 +1,39 @@
+# Example cmux configuration file.
+#
+# Copy to %APPDATA%\cmux\config.toml (Windows) or ~/.cmux.toml to use.
+# All fields are optional; missing fields fall back to defaults.
+
+[options]
+# Prefix key in tmux-style syntax. Default: "C-b"
+prefix = "C-a"
+
+# Override the shell to spawn in new panes.
+# Default on Windows: powershell.exe
+shell = "powershell.exe"
+
+# Scrollback buffer in lines. Default: 10000
+scrollback = 50000
+
+# Enable mouse capture (click to focus, scroll wheel). Default: true
+mouse = true
+
+# Timeout before prefix mode expires, in milliseconds. Default: 500
+escape_time_ms = 500
+
+# Base index for workspace/pane numbering. Default: 0
+base_index = 0
+
+[theme]
+# Built-in theme name. One of: dracula, catppuccin, nord, solarized_dark.
+name = "nord"
+
+[bindings]
+# Custom keybindings applied on top of the default tmux bindings.
+# Keys use tmux-style strings: "C-a", "%", "Up", "F5", etc.
+# Actions use kebab-case:
+#   split-vertical, split-horizontal, close-pane, toggle-zoom,
+#   cycle-pane, navigate-{up,down,left,right}, detach,
+#   create-workspace, next-workspace, prev-workspace,
+#   select-workspace-N, send-prefix, enter-copy-mode, paste
+"C-r" = "create-workspace"
+"F5" = "toggle-zoom"

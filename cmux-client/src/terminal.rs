@@ -1,6 +1,7 @@
 use crate::copy_mode::CopyModeState;
 use crate::pane_manager::PaneManager;
 use crate::renderer::{self, Renderer};
+use cmux_config::Config;
 use cmux_core::keybinding::{
     Action, CopyAction, CopyModeKeyTable, InputKey, KeyCode as CmuxKeyCode, KeyTable,
 };
@@ -57,13 +58,16 @@ pub async fn run_terminal<R, W>(
     mut pipe_reader: R,
     mut pipe_writer: W,
     session_name: &str,
+    config: &Config,
 ) -> anyhow::Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
     let _raw_guard = RawModeGuard::enable()?;
-    crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture)?;
+    if config.options.mouse {
+        crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture)?;
+    }
 
     let (cols, rows) = crossterm::terminal::size()?;
     debug!(cols, rows, "Terminal size");
@@ -71,11 +75,12 @@ where
     // Reserve bottom row for status bar
     let layout_rows = rows.saturating_sub(1).max(1);
 
+    let theme = config.resolve_theme();
     let mut panes = PaneManager::new_with_session(session_name.to_string(), layout_rows, cols);
-    let mut renderer = Renderer::new();
+    let mut renderer = Renderer::with_theme(theme.clone());
     let mut input_mode = InputMode::Normal;
     let mut event_stream = EventStream::new();
-    let key_table = KeyTable::default_tmux();
+    let key_table = config.build_key_table();
     let copy_mode_table = CopyModeKeyTable::default_vi();
 
     // Initial full render with status bar
@@ -89,6 +94,7 @@ where
             &panes.workspace_list(),
             cols,
             rows.saturating_sub(1),
+            &theme,
         )?;
         stdout.flush()?;
     }
@@ -213,6 +219,7 @@ where
                                             &panes.workspace_list(),
                                             term_cols,
                                             status_row,
+                                            &theme,
                                         )?;
                                         stdout.flush()?;
                                     } else {
@@ -250,6 +257,7 @@ where
                             &panes.workspace_list(),
                             new_cols,
                             new_rows.saturating_sub(1),
+                            &theme,
                         )?;
                         stdout.flush()?;
                     }
@@ -284,6 +292,7 @@ where
                                             &panes.workspace_list(),
                                             term_cols,
                                             term_rows.saturating_sub(1),
+                                            &theme,
                                         )?;
                                         stdout.flush()?;
                                     }
@@ -334,6 +343,7 @@ where
                             &panes.workspace_list(),
                             term_cols,
                             term_rows.saturating_sub(1),
+                            &theme,
                         )?;
                         stdout.flush()?;
                     }
@@ -366,6 +376,7 @@ where
                             &panes.workspace_list(),
                             term_cols,
                             term_rows.saturating_sub(1),
+                            &theme,
                         )?;
                         stdout.flush()?;
                     }
@@ -386,6 +397,7 @@ where
                             &panes.workspace_list(),
                             term_cols,
                             term_rows.saturating_sub(1),
+                            &theme,
                         )?;
                         stdout.flush()?;
                     }
@@ -406,6 +418,7 @@ where
                             &panes.workspace_list(),
                             term_cols,
                             term_rows.saturating_sub(1),
+                            &theme,
                         )?;
                         stdout.flush()?;
                     }
@@ -433,6 +446,7 @@ where
                             &panes.workspace_list(),
                             term_cols,
                             term_rows.saturating_sub(1),
+                            &theme,
                         )?;
                         stdout.flush()?;
                     }
@@ -494,6 +508,7 @@ async fn handle_prefix_command<W: AsyncWrite + Unpin>(
                 &panes.workspace_list(),
                 terminal_cols,
                 status_row,
+                renderer.theme(),
             )?;
             stdout.flush()?;
         }
@@ -517,6 +532,7 @@ async fn handle_prefix_command<W: AsyncWrite + Unpin>(
                 &panes.workspace_list(),
                 terminal_cols,
                 status_row,
+                renderer.theme(),
             )?;
             stdout.flush()?;
         }
@@ -535,6 +551,7 @@ async fn handle_prefix_command<W: AsyncWrite + Unpin>(
                 &panes.workspace_list(),
                 terminal_cols,
                 status_row,
+                renderer.theme(),
             )?;
             stdout.flush()?;
         }
@@ -550,6 +567,7 @@ async fn handle_prefix_command<W: AsyncWrite + Unpin>(
                 &panes.workspace_list(),
                 terminal_cols,
                 status_row,
+                renderer.theme(),
             )?;
             stdout.flush()?;
         }
@@ -565,6 +583,7 @@ async fn handle_prefix_command<W: AsyncWrite + Unpin>(
                 &panes.workspace_list(),
                 terminal_cols,
                 status_row,
+                renderer.theme(),
             )?;
             stdout.flush()?;
         }
@@ -582,6 +601,7 @@ async fn handle_prefix_command<W: AsyncWrite + Unpin>(
                 &panes.workspace_list(),
                 terminal_cols,
                 status_row,
+                renderer.theme(),
             )?;
             stdout.flush()?;
         }
@@ -599,6 +619,7 @@ async fn handle_prefix_command<W: AsyncWrite + Unpin>(
                 &panes.workspace_list(),
                 terminal_cols,
                 status_row,
+                renderer.theme(),
             )?;
             stdout.flush()?;
         }
@@ -614,6 +635,7 @@ async fn handle_prefix_command<W: AsyncWrite + Unpin>(
                 &panes.workspace_list(),
                 terminal_cols,
                 status_row,
+                renderer.theme(),
             )?;
             stdout.flush()?;
         }
@@ -629,6 +651,7 @@ async fn handle_prefix_command<W: AsyncWrite + Unpin>(
                 &panes.workspace_list(),
                 terminal_cols,
                 status_row,
+                renderer.theme(),
             )?;
             stdout.flush()?;
         }
@@ -769,6 +792,7 @@ fn render_copy_mode<W: Write>(
         Some("copy"),
         terminal_cols,
         status_row,
+        renderer.theme(),
     )?;
     out.flush()?;
     Ok(())

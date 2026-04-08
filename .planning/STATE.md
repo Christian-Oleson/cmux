@@ -2,9 +2,15 @@
 
 ## Current Position
 
-- **Phase:** 6 - Copy Mode & Scrollback
-- **Task:** All complete
-- **Status:** complete
+- **Phase:** 7 - Configuration & Themes
+- **Task:** 1 (pending)
+- **Status:** planned
+
+## Plan Created
+
+- Timestamp: 2026-04-07
+- Tasks: 2
+- Estimated complexity: Medium
 
 ## Progress
 
@@ -16,24 +22,31 @@
 | 4 | Sessions & Workspaces | :white_check_mark: Complete | 3/3 |
 | 5 | Input System & Keybindings | :white_check_mark: Complete | 2/2 |
 | 6 | Copy Mode & Scrollback | :white_check_mark: Complete | 2/2 |
-| 7 | Configuration & Themes | :hourglass: Waiting | 0/7 |
+| 7 | Configuration & Themes | :arrows_counterclockwise: Planned | 0/2 |
 | 8 | JSON-RPC API & Agent Integration | :hourglass: Waiting | 0/7 |
 | 9 | CLI Polish, Error Handling & Distribution | :hourglass: Waiting | 0/11 |
 
-## Verification Status
+## Phase 7 Task Breakdown
 
-| Check | Status |
-|-------|--------|
-| cargo build --workspace | :white_check_mark: Pass |
-| cargo clippy --workspace | :white_check_mark: Pass |
-| cargo fmt --all --check | :white_check_mark: Pass |
-| cargo test --workspace (115 tests) | :white_check_mark: Pass |
+| Task | Name | Type | Status |
+|------|------|------|--------|
+| 1 | Config types, TOML loading, built-in themes, key string parsing | backend | Pending |
+| 2 | Wire config and theme into renderer, terminal, and key table | integration | Pending |
+
+## Decisions
+
+- 2026-04-07: Config crate expanded with config.rs/theme.rs/parse.rs modules
+- 2026-04-07: 4 built-in themes hardcoded as named presets (dracula default)
+- 2026-04-07: Config loaded from %APPDATA%\cmux\config.toml or ~/.cmux.toml
+- 2026-04-07: Missing config file = silent fall back to defaults (no error)
+- 2026-04-07: Tmux-style key strings ("C-b", "%", "Up", "F1")
+- 2026-04-07: Theme replaces hardcoded Green/DarkGrey in renderer.rs:307,311
 
 ## Session Log
 
-- 2026-04-07: Phases 1-5 complete — 90 tests
-- 2026-04-07: Phase 6 complete — 115 tests
+- 2026-04-07: Phases 1-6 complete — 115 tests
+- 2026-04-07: Phase 7 plan created — 2 tasks
 
 ## Next Action
 
-Run `/apes-plan 7` to create Phase 7 task plan (Configuration & Themes)
+Run `/apes-execute 7` to start implementation

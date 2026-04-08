@@ -4,6 +4,16 @@ use std::io::{Read, Write};
 use std::sync::Mutex;
 use tracing::{debug, info};
 
+/// Default pane dimensions used when spawning a fresh PTY with no overrides.
+const DEFAULT_COLS: u16 = 80;
+const DEFAULT_ROWS: u16 = 24;
+
+#[cfg(windows)]
+const DEFAULT_SHELL: &str = "powershell.exe";
+
+#[cfg(not(windows))]
+const DEFAULT_SHELL: &str = "/bin/sh";
+
 /// Configuration for spawning a PTY instance.
 #[derive(Debug, Clone)]
 pub struct ConPtyConfig {
@@ -15,9 +25,9 @@ pub struct ConPtyConfig {
 impl Default for ConPtyConfig {
     fn default() -> Self {
         Self {
-            cols: cmux_config::defaults::DEFAULT_COLS,
-            rows: cmux_config::defaults::DEFAULT_ROWS,
-            shell: cmux_config::defaults::DEFAULT_SHELL.into(),
+            cols: DEFAULT_COLS,
+            rows: DEFAULT_ROWS,
+            shell: DEFAULT_SHELL.into(),
         }
     }
 }

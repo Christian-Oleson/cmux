@@ -51,6 +51,7 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     let pipe_name = cmux_config::defaults::PIPE_NAME;
+    let config = cmux_config::Config::load();
 
     match cli.command {
         Some(Commands::New { name }) => {
@@ -90,7 +91,7 @@ async fn main() -> anyhow::Result<()> {
             // The daemon may send a SessionState message once we're in the
             // terminal loop, which will rebuild the PaneManager.
             let (reader, writer) = conn.split();
-            terminal::run_terminal(reader, writer, &session_name).await?;
+            terminal::run_terminal(reader, writer, &session_name, &config).await?;
 
             println!("[detached]");
         }
@@ -130,7 +131,7 @@ async fn main() -> anyhow::Result<()> {
             // The daemon will send a SessionState message to rebuild workspace
             // state within the terminal loop.
             let (reader, writer) = conn.split();
-            terminal::run_terminal(reader, writer, &target).await?;
+            terminal::run_terminal(reader, writer, &target, &config).await?;
 
             println!("[detached]");
         }
