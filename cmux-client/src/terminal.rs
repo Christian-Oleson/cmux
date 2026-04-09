@@ -125,6 +125,12 @@ where
         stdout.flush()?;
     }
 
+    // Push our initial layout + per-pane dimensions to the daemon so the
+    // PTY for the starter pane matches our actual layout (not the daemon's
+    // legacy 80x24 default). Without this, TUIs query the PTY size and
+    // render for 80x24 while the client displays in a much larger area.
+    sync_layout_to_daemon(&panes, &mut pipe_writer).await?;
+
     loop {
         tokio::select! {
             event = event_stream.next() => {
@@ -281,6 +287,9 @@ where
                         debug!(cols = new_cols, rows = new_rows, "Terminal resized");
                         let new_layout_rows = new_rows.saturating_sub(1).max(1);
                         panes.resize_terminal(new_layout_rows, new_cols);
+                        // Push new per-pane dimensions to the daemon so
+                        // shells receive SIGWINCH and reflow accordingly.
+                        sync_layout_to_daemon(&panes, &mut pipe_writer).await?;
                         let snaps = panes.snapshots();
                         let mut stdout = std::io::stdout().lock();
                         renderer.render_full(
@@ -404,6 +413,9 @@ where
                         panes.switch_workspace(workspace_id);
                         // Resize the new workspace to current terminal dimensions
                         panes.resize_terminal(layout_rows, term_cols);
+                        // New workspace has a fresh pane — tell the daemon
+                        // its target dimensions and persist the layout.
+                        sync_layout_to_daemon(&panes, &mut pipe_writer).await?;
                         let snaps = panes.snapshots();
                         let mut stdout = std::io::stdout().lock();
                         renderer.render_full(
@@ -424,6 +436,7 @@ where
                     }
                     Ok(Some(ServerMessage::WorkspaceClosed { workspace_id })) => {
                         panes.close_workspace(workspace_id);
+                        sync_layout_to_daemon(&panes, &mut pipe_writer).await?;
                         let (term_cols, term_rows) = crossterm::terminal::size()?;
                         let snaps = panes.snapshots();
                         let mut stdout = std::io::stdout().lock();
@@ -445,6 +458,10 @@ where
                     }
                     Ok(Some(ServerMessage::WorkspaceSwitched { workspace_id })) => {
                         panes.switch_workspace(workspace_id);
+                        // Active workspace changed — push the new
+                        // workspace's layout so the daemon's stored state
+                        // reflects what we're currently viewing.
+                        sync_layout_to_daemon(&panes, &mut pipe_writer).await?;
                         let (term_cols, term_rows) = crossterm::terminal::size()?;
                         let snaps = panes.snapshots();
                         let mut stdout = std::io::stdout().lock();
@@ -474,6 +491,13 @@ where
                             layout_rows,
                             term_cols,
                         );
+                        // Tell the daemon to resize PTYs to match our
+                        // reconstructed layout. This happens after the
+                        // daemon has already sent pane snapshot bytes for
+                        // the old dimensions — the shell will receive
+                        // SIGWINCH on resize and redraw for the new size,
+                        // which lands as additional PaneOutput shortly after.
+                        sync_layout_to_daemon(&panes, &mut pipe_writer).await?;
                         let snaps = panes.snapshots();
                         let mut stdout = std::io::stdout().lock();
                         renderer.render_full(
@@ -526,6 +550,66 @@ where
     Ok(())
 }
 
+/// Push the client's current layout + per-pane dimensions to the daemon.
+///
+/// Called after any layout change (attach, terminal resize, split, close,
+/// zoom toggle, navigate, workspace switch). Sends one `ResizePane` per
+/// pane in the active workspace followed by a single `SetLayout` so the
+/// daemon can restore the exact layout on a future reattach.
+///
+/// All messages are fire-and-forget; the daemon logs on failure but does
+/// not respond. If an individual `ResizePane` arrives before the daemon
+/// has finished spawning a just-split PTY, the daemon simply logs
+/// `PaneNotFound` and the next sync call will retry.
+async fn sync_layout_to_daemon<W: AsyncWrite + Unpin>(
+    panes: &PaneManager,
+    pipe_writer: &mut W,
+) -> anyhow::Result<()> {
+    for (pane_id, cols, rows) in panes.pane_resize_intents() {
+        transport::write_message(
+            pipe_writer,
+            &ClientMessage::ResizePane {
+                pane_id,
+                cols,
+                rows,
+            },
+        )
+        .await?;
+    }
+    if let Some((workspace_id, layout, active_pane)) = panes.current_layout_snapshot() {
+        transport::write_message(
+            pipe_writer,
+            &ClientMessage::SetLayout {
+                workspace_id,
+                layout,
+                active_pane,
+            },
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// Send only the layout snapshot (no per-pane resize). Used when the
+/// active pane changes but no pane's dimensions did (navigate, cycle).
+async fn sync_active_pane_to_daemon<W: AsyncWrite + Unpin>(
+    panes: &PaneManager,
+    pipe_writer: &mut W,
+) -> anyhow::Result<()> {
+    if let Some((workspace_id, layout, active_pane)) = panes.current_layout_snapshot() {
+        transport::write_message(
+            pipe_writer,
+            &ClientMessage::SetLayout {
+                workspace_id,
+                layout,
+                active_pane,
+            },
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 async fn handle_prefix_command<W: AsyncWrite + Unpin>(
     key: &KeyEvent,
     key_table: &KeyTable,
@@ -540,15 +624,29 @@ async fn handle_prefix_command<W: AsyncWrite + Unpin>(
 
     match key_table.resolve_prefix(&input_key) {
         Some(Action::SplitVertical) => {
-            let direction = SplitDirection::Vertical;
+            // Split locally FIRST so we can compute the new pane's target
+            // dimensions from the layout, then tell the daemon to spawn a
+            // PTY at exactly those dims. Previously the daemon hardcoded
+            // 80x24 which broke TUI rendering.
+            let new_pane_id = panes.split(SplitDirection::Vertical);
+            let (new_cols, new_rows) = panes
+                .layout()
+                .pane_rects()
+                .into_iter()
+                .find(|r| r.pane_id == new_pane_id)
+                .map(|r| (r.width, r.height))
+                .unwrap_or((80, 24));
             transport::write_message(
                 pipe_writer,
                 &ClientMessage::SplitPane {
                     direction: "vertical".into(),
+                    cols: new_cols,
+                    rows: new_rows,
                 },
             )
             .await?;
-            panes.split(direction);
+            // Sync all pane dimensions + the new layout tree to the daemon.
+            sync_layout_to_daemon(panes, pipe_writer).await?;
             let snaps = panes.snapshots();
             let mut stdout = std::io::stdout().lock();
             renderer.render_full(&snaps, panes.layout(), panes.active_pane(), &mut stdout)?;
@@ -564,15 +662,24 @@ async fn handle_prefix_command<W: AsyncWrite + Unpin>(
         }
 
         Some(Action::SplitHorizontal) => {
-            let direction = SplitDirection::Horizontal;
+            let new_pane_id = panes.split(SplitDirection::Horizontal);
+            let (new_cols, new_rows) = panes
+                .layout()
+                .pane_rects()
+                .into_iter()
+                .find(|r| r.pane_id == new_pane_id)
+                .map(|r| (r.width, r.height))
+                .unwrap_or((80, 24));
             transport::write_message(
                 pipe_writer,
                 &ClientMessage::SplitPane {
                     direction: "horizontal".into(),
+                    cols: new_cols,
+                    rows: new_rows,
                 },
             )
             .await?;
-            panes.split(direction);
+            sync_layout_to_daemon(panes, pipe_writer).await?;
             let snaps = panes.snapshots();
             let mut stdout = std::io::stdout().lock();
             renderer.render_full(&snaps, panes.layout(), panes.active_pane(), &mut stdout)?;
@@ -592,6 +699,8 @@ async fn handle_prefix_command<W: AsyncWrite + Unpin>(
             transport::write_message(pipe_writer, &ClientMessage::ClosePane { pane_id: active.0 })
                 .await?;
             panes.close_pane(active);
+            // Closing a pane reshapes all siblings — resync dimensions.
+            sync_layout_to_daemon(panes, pipe_writer).await?;
             let snaps = panes.snapshots();
             let mut stdout = std::io::stdout().lock();
             renderer.render_full(&snaps, panes.layout(), panes.active_pane(), &mut stdout)?;
@@ -608,6 +717,10 @@ async fn handle_prefix_command<W: AsyncWrite + Unpin>(
 
         Some(Action::ToggleZoom) => {
             panes.layout_mut().toggle_zoom();
+            // Zoom changes which panes are visible + their dimensions
+            // (zoomed pane fills the terminal). Resync so PTYs reflect
+            // the current visible rects.
+            sync_layout_to_daemon(panes, pipe_writer).await?;
             let snaps = panes.snapshots();
             let mut stdout = std::io::stdout().lock();
             renderer.render_full(&snaps, panes.layout(), panes.active_pane(), &mut stdout)?;
@@ -624,6 +737,7 @@ async fn handle_prefix_command<W: AsyncWrite + Unpin>(
 
         Some(Action::CyclePaneForward) => {
             panes.layout_mut().cycle_pane(true);
+            sync_active_pane_to_daemon(panes, pipe_writer).await?;
             let snaps = panes.snapshots();
             let mut stdout = std::io::stdout().lock();
             renderer.render_full(&snaps, panes.layout(), panes.active_pane(), &mut stdout)?;
@@ -642,6 +756,7 @@ async fn handle_prefix_command<W: AsyncWrite + Unpin>(
             panes
                 .layout_mut()
                 .navigate(SplitDirection::Horizontal, false);
+            sync_active_pane_to_daemon(panes, pipe_writer).await?;
             let snaps = panes.snapshots();
             let mut stdout = std::io::stdout().lock();
             renderer.render_diff(&snaps, panes.layout(), panes.active_pane(), &mut stdout)?;
@@ -660,6 +775,7 @@ async fn handle_prefix_command<W: AsyncWrite + Unpin>(
             panes
                 .layout_mut()
                 .navigate(SplitDirection::Horizontal, true);
+            sync_active_pane_to_daemon(panes, pipe_writer).await?;
             let snaps = panes.snapshots();
             let mut stdout = std::io::stdout().lock();
             renderer.render_diff(&snaps, panes.layout(), panes.active_pane(), &mut stdout)?;
@@ -676,6 +792,7 @@ async fn handle_prefix_command<W: AsyncWrite + Unpin>(
 
         Some(Action::NavigateLeft) => {
             panes.layout_mut().navigate(SplitDirection::Vertical, false);
+            sync_active_pane_to_daemon(panes, pipe_writer).await?;
             let snaps = panes.snapshots();
             let mut stdout = std::io::stdout().lock();
             renderer.render_diff(&snaps, panes.layout(), panes.active_pane(), &mut stdout)?;
@@ -692,6 +809,7 @@ async fn handle_prefix_command<W: AsyncWrite + Unpin>(
 
         Some(Action::NavigateRight) => {
             panes.layout_mut().navigate(SplitDirection::Vertical, true);
+            sync_active_pane_to_daemon(panes, pipe_writer).await?;
             let snaps = panes.snapshots();
             let mut stdout = std::io::stdout().lock();
             renderer.render_diff(&snaps, panes.layout(), panes.active_pane(), &mut stdout)?;

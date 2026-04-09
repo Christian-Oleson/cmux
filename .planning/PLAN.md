@@ -1,429 +1,702 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- Dos Apes Super Agent Framework - Phase Plan -->
 <!-- Generated: 2026-04-08 -->
-<!-- Phase: Install (post-v1.0 MSI installer) -->
+<!-- Phase: Resize (post-v1.0 hotfix bundle) -->
 
 <plan>
   <metadata>
-    <phase>Install</phase>
-    <name>MSI Installer via cargo-wix</name>
-    <goal>Produce a single .msi file that installs cmux-daemon.exe and cmux-client.exe system-wide on any Windows 10/11 machine, adds them to PATH, and ships as a release artifact from CI</goal>
-    <deliverable>A `cargo wix` command that produces target/wix/cmux-x.y.z-x86_64.msi locally, and a release workflow that uploads the same MSI alongside the existing zip on tag push</deliverable>
+    <phase>Resize</phase>
+    <name>Terminal Resize Propagation + Multi-Pane Reattach</name>
+    <goal>Fix two user-visible bugs that dogfooding surfaced: (1) TUIs like Claude Code render corrupted because the daemon's PTY dimensions never match the client's pane dimensions, (2) reattaching to a multi-pane session collapses the layout to a single pane because SessionState doesn't carry the layout tree</goal>
+    <deliverable>Interactive TUIs (Claude Code, vim, fzf, htop) render correctly inside cmux, and detach-then-reattach to a split session preserves the exact layout that was there at detach time</deliverable>
     <created>2026-04-08</created>
   </metadata>
 
   <context>
     <dependencies>
-      v1.0 already shipped on main. Release binaries (cmux-daemon.exe, cmux-client.exe)
-      already build cleanly from `cargo build --release --workspace`. README, example
-      config, and scripts/cmux-rpc.ps1 all exist and are referenced in the existing
-      release.yml workflow's zip packaging.
+      v1.0 on main, 168 tests passing. The three post-v1.0 hotfixes are in
+      (SHIFT modifier strip, tokio::select cancel-safety, reader abort on
+      detach). Phase Install shipped the MSI. This phase is the next round of
+      dogfooding-driven fixes.
     </dependencies>
     <affected_areas>
-      - Root Cargo.toml: new [package.metadata.wix] section (attached to a bin crate)
-      - New directory: wix/ containing main.wxs (WiX source), License.rtf (shown in installer UI)
-      - cmux-daemon/Cargo.toml: cargo-wix reads metadata per-crate, needs [package.metadata.wix] here
-      - .github/workflows/release.yml: add cargo-wix install + msi build + upload step
-      - README.md: add "Install from MSI" section pointing at GitHub Releases
-      - .gitignore: ignore wix/*.wixobj wix/*.wixpdb target/wix/
+      - cmux-ipc/Cargo.toml: new dep on cmux-core so ClientMessage can carry LayoutNode
+      - cmux-ipc/src/messages.rs: new ClientMessage::ResizePane variant, extend WorkspaceInfo with layout tree
+      - cmux-daemon/src/session_manager.rs: new resize_pane method; spawn_pty takes cols/rows as params that match caller intent (not hardcoded 80x24)
+      - cmux-daemon/src/server.rs: handle ResizePane, pass cols/rows from SplitPane into split_pane, attach handler reads layout from client instead of sending blank state
+      - cmux-client/src/terminal.rs: on initial connect, on Event::Resize, and after each split, send ResizePane messages for all panes; on receive SessionState, reconstruct layout tree via new PaneManager method
+      - cmux-client/src/pane_manager.rs: expose LayoutNode directly from LayoutEngine; rebuild_from_state accepts optional LayoutNode per workspace and reconstructs the tree instead of creating a flat single-pane layout
+      - cmux-core/src/layout.rs: add LayoutEngine::from_tree() or similar constructor that rebuilds state from a serialized LayoutNode + terminal dims + active pane
     </affected_areas>
     <patterns_to_follow>
-      - Use cargo-wix 0.3.x + WiX 3.x (pre-installed on GitHub Actions windows-latest)
-      - Single MSI packages BOTH binaries (cmux-daemon and cmux-client) — hand-edit
-        wix/main.wxs to add the second binary as an additional Component
-      - Per-machine install (Program Files) with system PATH modification — needs
-        admin, but that's acceptable for a "install on another machine" workflow
-      - Stable UpgradeCode GUID — pick once, never change, so 0.1.0 -> 0.2.0 upgrades
-        cleanly without leaving orphaned installs
-      - Also install README.md, cmux-config/example/cmux.toml, scripts/cmux-rpc.ps1
-        to the install directory for convenience
-      - No code signing (requires a cert) — users will see a SmartScreen warning on
-        first install and have to click "Run anyway". Document this as a caveat.
+      - LayoutNode is already Serialize/Deserialize in cmux-core — just expose it through cmux-ipc
+      - tmux's model: PTY dimensions always match the client's computed pane rect. On resize, the client is authoritative; it recomputes its layout and pushes new dims to the daemon, which resizes PTY + ScreenBuffer in lockstep.
+      - Daemon doesn't own layout — it only owns pane processes and per-pane ScreenBuffers. Layout lives in the client. Multi-client attach is not supported for multi-pane layouts (documented limitation; same as single-active-client model we already have).
+      - Resize messages are fire-and-forget (no response). Out-of-order delivery is impossible because a single client uses a single pipe with serialized writes.
+      - On attach, the client sends ResizePane for every pane right after it receives SessionState, so the daemon's PTYs match the client's layout before any PaneOutput replay lands.
     </patterns_to_follow>
   </context>
 
   <tasks>
-    <task id="1" type="setup" complete="false">
-      <name>Local MSI build: install cargo-wix, bootstrap wix/main.wxs, customize for two binaries + docs</name>
+    <task id="1" type="backend" complete="false">
+      <name>IPC: add ResizePane message, embed LayoutNode in WorkspaceInfo, wire cmux-ipc to cmux-core</name>
       <description>
-        Get `cargo wix` producing a working MSI on the local dev machine.
-        Most of the work is in wix/main.wxs — cargo-wix's init template only
-        includes one binary, so we hand-edit it to also package cmux-client.exe,
-        add PATH modification, and drop README + example config + RPC script
-        into the install directory.
+        Extend the wire protocol so clients can tell the daemon "resize pane N
+        to C×R" and the daemon can ship a full layout tree on attach. This is
+        the foundation for both fixes — resize propagation AND multi-pane
+        reattach flow through the same WorkspaceInfo + ResizePane additions.
       </description>
 
       <files>
-        <create>
-          wix/main.wxs                           (WiX XML, generated by `cargo wix init` then hand-edited)
-          wix/License.rtf                        (RTF license shown in installer UI; minimal MIT/Apache blurb)
-        </create>
         <modify>
-          cmux-daemon/Cargo.toml                 (add [package.metadata.wix] with UpgradeCode, LicenseSource, etc.)
-          .gitignore                             (ignore target/wix/, wix/*.wixobj, wix/*.wixpdb)
+          cmux-ipc/Cargo.toml              (add cmux-core workspace dep)
+          cmux-ipc/src/messages.rs         (ClientMessage::ResizePane variant; WorkspaceInfo::layout field)
         </modify>
       </files>
 
       <action>
-        **Prerequisites (manual, one-time per dev machine):**
+        1. Add `cmux-core = { workspace = true }` to cmux-ipc/Cargo.toml under
+           [dependencies]. cmux-core does NOT depend on cmux-ipc, so this does
+           not create a cycle (verified).
 
-        1. Install WiX Toolset v3.11 from https://github.com/wixtoolset/wix3/releases
-           — or via chocolatey: `choco install wixtoolset`
-           Verify `candle.exe` and `light.exe` are on PATH.
+        2. In cmux-ipc/src/messages.rs, add the new ClientMessage variant at
+           the bottom of the enum:
 
-        2. Install cargo-wix:
-           ```powershell
-           cargo install cargo-wix --version "^0.3"
-           ```
-
-        **Implementation steps:**
-
-        3. Add to cmux-daemon/Cargo.toml:
-           ```toml
-           [package.metadata.wix]
-           upgrade-guid = "3a7e2f8c-1d4b-4e9a-8f2c-9b5e7d1a6c4f"
-           path-guid    = "f1b2c3d4-5e6f-7a8b-9c0d-1e2f3a4b5c6d"
-           license      = false   # we supply our own License.rtf
-           eula         = false
-           name         = "cmux"
-           product-name = "cmux — Windows terminal multiplexer"
-           manufacturer = "cmux contributors"
-           ```
-           (Generate fresh GUIDs if you want; these are placeholders but they must
-           be stable across versions once committed. `cargo wix print` can help.)
-
-        4. Bootstrap the wix directory:
-           ```powershell
-           cd C:\Projects\cmux
-           cargo wix init -p cmux-daemon
-           ```
-           This creates `wix/main.wxs` and `wix/License.rtf` templates. The default
-           template packages just cmux-daemon.exe.
-
-        5. Hand-edit `wix/main.wxs` to add cmux-client.exe + docs + scripts. The
-           cargo-wix generated template has a `<Feature>` and `<Component>` for the
-           binary. Add a second `<Component>` inside the same `<Feature>`:
-
-           ```xml
-           <Component Id="cmux_client_exe" Guid="*">
-             <File Id="cmux_client_exe_file"
-                   Name="cmux-client.exe"
-                   DiskId="1"
-                   Source="$(var.CargoTargetBinDir)\cmux-client.exe"
-                   KeyPath="yes"/>
-           </Component>
-
-           <Component Id="readme_md" Guid="*">
-             <File Id="readme_md_file"
-                   Name="README.md"
-                   DiskId="1"
-                   Source="README.md"
-                   KeyPath="yes"/>
-           </Component>
-
-           <Component Id="example_toml" Guid="*">
-             <File Id="example_toml_file"
-                   Name="cmux.example.toml"
-                   DiskId="1"
-                   Source="cmux-config\example\cmux.toml"
-                   KeyPath="yes"/>
-           </Component>
-
-           <Component Id="rpc_ps1" Guid="*">
-             <File Id="rpc_ps1_file"
-                   Name="cmux-rpc.ps1"
-                   DiskId="1"
-                   Source="scripts\cmux-rpc.ps1"
-                   KeyPath="yes"/>
-           </Component>
-           ```
-
-           Add matching `<ComponentRef Id="..."/>` lines inside `<Feature>` so they
-           actually ship.
-
-        6. Add PATH modification. Inside the `INSTALLFOLDER` Directory (or its
-           parent bin directory, depending on the generated template), add a
-           Component containing an `<Environment>` element:
-
-           ```xml
-           <Component Id="path_env" Guid="*" KeyPath="yes">
-             <Environment Id="PATH"
-                          Name="PATH"
-                          Value="[INSTALLFOLDER]"
-                          Permanent="no"
-                          Part="last"
-                          Action="set"
-                          System="yes"/>
-           </Component>
-           ```
-
-           Reference it with a `<ComponentRef Id="path_env"/>` under the Feature.
-
-        7. Edit `wix/License.rtf` to contain a minimal license blurb (MIT or
-           Apache-2.0 — pick one, match what's claimed in the README). WiX requires
-           the license file to be valid RTF. You can write it in WordPad or paste
-           a minimal RTF header + plain text. A one-liner is fine:
-
-           ```rtf
-           {\rtf1\ansi
-           cmux is dual-licensed under MIT or Apache-2.0. See README.md.
+           ```rust
+           pub enum ClientMessage {
+               // ... existing variants ...
+               ResizePane {
+                   pane_id: u32,
+                   cols: u16,
+                   rows: u16,
+               },
            }
            ```
 
-        8. Update `.gitignore`:
+        3. Extend WorkspaceInfo to carry an optional layout tree:
+
+           ```rust
+           use cmux_core::layout::LayoutNode;
+
+           #[derive(Debug, Clone, Serialize, Deserialize)]
+           pub struct WorkspaceInfo {
+               pub id: u32,
+               pub name: String,
+               pub pane_ids: Vec&lt;u32&gt;,
+               /// Full binary split tree for this workspace, if the sender
+               /// has one. Optional so older clients / servers that still
+               /// only ship pane_ids keep working.
+               #[serde(default, skip_serializing_if = "Option::is_none")]
+               pub layout: Option&lt;LayoutNode&gt;,
+               /// Active pane id within this workspace, if known.
+               #[serde(default, skip_serializing_if = "Option::is_none")]
+               pub active_pane: Option&lt;u32&gt;,
+           }
            ```
-           /target
-           wix/*.wixobj
-           wix/*.wixpdb
+
+           The `#[serde(default, skip_serializing_if = "Option::is_none")]`
+           combo means existing round-trip tests still pass and any old daemon
+           that sends a WorkspaceInfo without these fields is accepted.
+
+        4. Update the existing messages::tests::workspace_info_round_trip test
+           to include a layout-free variant AND a layout-carrying variant:
+
+           - Existing test: construct with layout: None, active_pane: None,
+             assert round-trip and pane_ids preserved.
+           - New test: construct WorkspaceInfo with Some(LayoutNode::Split {
+             direction: SplitDirection::Vertical, ratio: 0.5,
+             first: Box::new(LayoutNode::Leaf { pane_id: PaneId(0) }),
+             second: Box::new(LayoutNode::Leaf { pane_id: PaneId(1) }),
+           }) plus active_pane: Some(1). Round-trip, assert the tree shape
+           and active_pane survive.
+
+        5. Add a round-trip test for ClientMessage::ResizePane:
+
+           ```rust
+           #[test]
+           fn resize_pane_round_trip() {
+               let msg = ClientMessage::ResizePane { pane_id: 3, cols: 120, rows: 40 };
+               let json = serde_json::to_string(&amp;msg).unwrap();
+               let back: ClientMessage = serde_json::from_str(&amp;json).unwrap();
+               match back {
+                   ClientMessage::ResizePane { pane_id, cols, rows } =&gt; {
+                       assert_eq!(pane_id, 3);
+                       assert_eq!(cols, 120);
+                       assert_eq!(rows, 40);
+                   }
+                   _ =&gt; panic!("wrong variant"),
+               }
+           }
            ```
-           (Don't ignore wix/main.wxs or wix/License.rtf — those are source.)
 
-        9. Test the local build:
-           ```powershell
-           cargo wix -p cmux-daemon --nocapture
+        6. Verify nothing else broke:
            ```
-           Should produce `target/wix/cmux-0.1.0-x86_64.msi`. Watch for WiX errors
-           about missing files or bad paths and fix the Source= attributes.
-
-        10. **Install + test**: double-click the MSI, accept the UAC prompt, step
-            through the installer. After install, open a NEW PowerShell window
-            (the existing one won't have the updated PATH) and verify:
-            ```powershell
-            cmux-daemon.exe --help   # or just run it and Ctrl+C
-            cmux-client.exe ls
-            ```
-            Both should work from anywhere on the system.
-
-        11. **Test upgrade**: re-run `cargo wix`, install the same MSI on top of
-            itself. It should uninstall the previous version cleanly thanks to
-            the stable UpgradeCode.
-
-        12. **Test uninstall** via "Apps & features" → cmux → Uninstall. Verify
-            both exes are gone and PATH no longer contains the install directory.
+           cargo build --workspace
+           cargo test -p cmux-ipc
+           cargo clippy --workspace
+           ```
       </action>
 
       <verification>
-        <command>cargo wix -p cmux-daemon</command>
-        <manual>
-          1. target/wix/cmux-0.1.0-x86_64.msi exists and is 3-5 MB
-          2. Installer runs, shows UAC prompt, completes without error
-          3. New PowerShell window has cmux-daemon.exe and cmux-client.exe on PATH
-          4. Both binaries run from any directory
-          5. Uninstall via Control Panel removes everything
-          6. Re-install on top of existing install upgrades cleanly (no "already installed" error)
-        </manual>
+        <command>cargo build --workspace</command>
+        <command>cargo test -p cmux-ipc</command>
+        <command>cargo clippy --workspace -- -D warnings</command>
       </verification>
 
       <done>
-        - `cargo wix -p cmux-daemon` produces a working MSI locally
-        - MSI installs both binaries + README + example config + RPC script
-        - System PATH is updated so both exes are callable from any shell
-        - Uninstall cleanly removes everything including the PATH entry
-        - Upgrade (install-over-existing) works without manual cleanup
-        - wix/main.wxs and wix/License.rtf committed to repo
-        - .gitignore updated for build artifacts
+        - ClientMessage::ResizePane variant compiles and round-trips through JSON
+        - WorkspaceInfo has optional layout + active_pane fields, both serde-compatible with existing tests
+        - cmux-ipc depends on cmux-core (no cycle)
+        - 2 new tests added, all existing tests still pass (170 total)
       </done>
     </task>
 
-    <task id="2" type="deploy" complete="false">
-      <name>Wire MSI into release.yml workflow and document install in README</name>
+    <task id="2" type="backend" complete="false">
+      <name>Daemon: resize_pane method, SplitPane takes real dims, SessionState emits layout tree</name>
       <description>
-        Extend the existing release workflow so `git tag v*` produces an MSI
-        artifact uploaded to the GitHub Release alongside the existing zip.
-        Add an "Install from MSI" section to README.md pointing at the Releases
-        page.
+        Make the daemon actually act on resize requests and stop hardcoding 80x24
+        for splits. SessionState on attach needs to be populated from somewhere —
+        since the daemon doesn't own layout, the workflow is: client sends its
+        current layout via a new `LayoutSnapshot` or repurposed mechanism… OR,
+        simpler, the daemon just stores the last layout it received from the
+        client per session and replays it back on attach. Pick the latter: much
+        less IPC surface.
       </description>
 
       <files>
         <modify>
-          .github/workflows/release.yml          (install cargo-wix, build MSI, upload as release asset)
-          README.md                              (add Install from MSI section under existing install docs)
+          cmux-daemon/src/session_manager.rs  (add resize_pane, store per-session last_layout, add set_layout/get_layout)
+          cmux-daemon/src/server.rs           (handle ResizePane; SplitPane passes cols/rows through; SessionState populates layout from stored snapshot; add a ClientMessage::SetLayout OR piggyback layout on ResizePane flow)
         </modify>
       </files>
 
       <action>
-        1. Edit `.github/workflows/release.yml`. After the existing cargo-build
-           step and before the Package Artifacts step, add:
+        1. In cmux-daemon/src/session_manager.rs, add fields to ManagedSession:
+           ```rust
+           struct ManagedSession {
+               // ... existing ...
+               /// Most recent layout tree per workspace, sent by the client
+               /// via SetLayout. Used to rehydrate SessionState on reattach.
+               workspace_layouts: HashMap&lt;u32, cmux_core::layout::LayoutNode&gt;,
+               workspace_active_panes: HashMap&lt;u32, u32&gt;,
+           }
+           ```
+           Initialize to empty HashMaps in create_session.
 
-           ```yaml
-           - name: Install cargo-wix
-             run: cargo install cargo-wix --version "^0.3" --locked
-
-           - name: Build MSI
-             run: cargo wix -p cmux-daemon --nocapture
+        2. Add a new public method:
+           ```rust
+           pub async fn resize_pane(
+               &amp;self,
+               session_name: &amp;str,
+               pane_id: u32,
+               cols: u16,
+               rows: u16,
+           ) -&gt; Result&lt;(), CmuxError&gt; {
+               let sessions = self.sessions.lock().await;
+               let session = sessions
+                   .get(session_name)
+                   .ok_or_else(|| CmuxError::SessionNotFound(session_name.into()))?;
+               for ws in session.workspaces.values() {
+                   if let Some(pane) = ws.panes.get(&amp;pane_id) {
+                       pane.pty.resize(cols, rows)?;
+                       let mut screen = pane.screen.lock().await;
+                       screen.resize(rows, cols);
+                       return Ok(());
+                   }
+               }
+               Err(CmuxError::PaneNotFound(cmux_core::types::PaneId(pane_id)))
+           }
            ```
 
-           GitHub's `windows-latest` runner has WiX 3.x pre-installed, so no
-           separate WiX install step is needed. (Verify this — if WiX isn't on
-           PATH, add `choco install wixtoolset -y` before the cargo-wix install.)
+           Note: `ConPty::resize` already exists (wraps portable-pty). The key
+           insight is we MUST resize both the PTY and the daemon-side
+           ScreenBuffer in the same call, otherwise they desync the same way
+           the client did.
 
-        2. Update the Package Artifacts step to also copy the MSI into the
-           release staging directory:
-
-           ```yaml
-           - name: Package artifacts
-             shell: pwsh
-             run: |
-               $tag = "${{ github.ref_name }}"
-               $stage = "release-stage"
-               New-Item -ItemType Directory -Path $stage -Force | Out-Null
-               Copy-Item target/release/cmux-daemon.exe $stage/
-               Copy-Item target/release/cmux-client.exe $stage/
-               Copy-Item README.md $stage/
-               Copy-Item REQUIREMENTS.md $stage/
-               Copy-Item cmux-config/example/cmux.toml $stage/cmux.example.toml
-               Copy-Item scripts/cmux-rpc.ps1 $stage/cmux-rpc.ps1
-               $zip = "cmux-$tag-windows-x64.zip"
-               Compress-Archive -Path $stage/* -DestinationPath $zip -Force
-
-               # Also copy the MSI to a predictable name for upload
-               $msi = Get-ChildItem target/wix/*.msi | Select-Object -First 1
-               Copy-Item $msi "cmux-$tag-windows-x64.msi"
+        3. Add layout snapshot storage methods:
+           ```rust
+           pub async fn set_layout(
+               &amp;self,
+               session_name: &amp;str,
+               workspace_id: u32,
+               layout: cmux_core::layout::LayoutNode,
+               active_pane: u32,
+           ) -&gt; Result&lt;(), CmuxError&gt; {
+               let mut sessions = self.sessions.lock().await;
+               let session = sessions
+                   .get_mut(session_name)
+                   .ok_or_else(|| CmuxError::SessionNotFound(session_name.into()))?;
+               session.workspace_layouts.insert(workspace_id, layout);
+               session.workspace_active_panes.insert(workspace_id, active_pane);
+               Ok(())
+           }
            ```
 
-        3. Update the `Upload release` step's `files:` list to include the MSI:
+        4. Update `get_session_state` to include the stored layout tree and
+           active pane per workspace in the returned `WorkspaceInfo`.
 
-           ```yaml
-           - name: Upload release
-             uses: softprops/action-gh-release@v2
-             with:
-               files: |
-                 cmux-*.zip
-                 cmux-*.msi
-               draft: false
-               generate_release_notes: true
+           ```rust
+           let workspaces: Vec&lt;WorkspaceInfo&gt; = session
+               .workspaces
+               .values()
+               .map(|ws| WorkspaceInfo {
+                   id: ws.id,
+                   name: ws.name.clone(),
+                   pane_ids: ws.panes.keys().copied().collect(),
+                   layout: session.workspace_layouts.get(&amp;ws.id).cloned(),
+                   active_pane: session.workspace_active_panes.get(&amp;ws.id).copied(),
+               })
+               .collect();
            ```
 
-        4. Update README.md. Find the existing "Install from source" section.
-           Add a new section ABOVE it titled "Install from MSI":
+           Sort by workspace id like the existing code does.
 
-           ```markdown
-           ## Install from MSI (recommended for end users)
+        5. In cmux-daemon/src/server.rs, handle the new ClientMessage::ResizePane
+           and ClientMessage::SetLayout messages:
 
-           1. Download the latest `cmux-vX.Y.Z-windows-x64.msi` from the
-              [Releases page](https://github.com/USER/cmux/releases).
-           2. Double-click to run. Accept the UAC prompt (the installer needs
-              admin rights to modify system PATH).
-           3. Windows SmartScreen may warn that the installer is from an
-              unknown publisher. cmux is not code-signed — click **More info**
-              → **Run anyway**.
-           4. After install, open a **new** PowerShell window (existing windows
-              won't have the updated PATH).
-           5. Run `cmux-daemon` in one window and `cmux-client new -s main`
-              in another.
-
-           The MSI installs to `C:\Program Files\cmux\` and adds that directory
-           to system PATH. Uninstall via **Apps & features** → cmux.
-
-           ## Install from source
-           ... (existing content stays)
+           ```rust
+           ClientMessage::ResizePane { pane_id, cols, rows } =&gt; {
+               if let Some(ref session_name) = attached_session {
+                   if let Err(e) = session_manager
+                       .resize_pane(session_name, pane_id, cols, rows)
+                       .await
+                   {
+                       warn!(error = %e, "Failed to resize pane");
+                   }
+               }
+           }
            ```
 
-        5. After committing, tag a test release locally (don't push yet) and
-           verify the workflow syntax:
-           ```powershell
-           gh workflow view release.yml
+           For SetLayout, add a new ClientMessage variant in Task 1's addendum
+           OR piggyback it as part of an existing message. Clean path: add a
+           `ClientMessage::SetLayout { workspace_id, layout, active_pane }`
+           variant alongside ResizePane in Task 1, then handle it here:
+
+           ```rust
+           ClientMessage::SetLayout { workspace_id, layout, active_pane } =&gt; {
+               if let Some(ref session_name) = attached_session {
+                   let _ = session_manager
+                       .set_layout(session_name, workspace_id, layout, active_pane)
+                       .await;
+               }
+           }
            ```
-           Or use `act` if installed, or just push the branch and check the
-           Actions tab in the GitHub UI.
+
+           (Task 1 should include `SetLayout` alongside `ResizePane` — add it
+           there instead of splitting the IPC change across two tasks.)
+
+        6. Fix `ClientMessage::SplitPane { direction }` to pass real dimensions
+           instead of hardcoded 80x24. This requires changing the IPC to
+           include the target cols/rows on split:
+
+           ```rust
+           ClientMessage::SplitPane { direction: String, cols: u16, rows: u16 }
+           ```
+
+           (Also part of Task 1. Make sure round-trip test covers the new fields.)
+
+           In server.rs:
+           ```rust
+           ClientMessage::SplitPane { direction: _, cols, rows } =&gt; {
+               if let Some(ref session_name) = attached_session {
+                   match session_manager.split_pane(session_name, cols, rows).await {
+                       // ... same as before ...
+                   }
+               }
+           }
+           ```
+
+        7. On Attach, after get_session_state fills in the layout, the existing
+           pane snapshot replay still runs. The PTYs might be at the old size
+           from the previous session; the client will send ResizePane right
+           after SessionState arrives (Task 3), which will resize the PTYs and
+           the daemon-side ScreenBuffers. The snapshot replay uses
+           `ScreenBuffer::contents_formatted()` which returns the current
+           post-resize state; this is fine because the client sends resize
+           BEFORE consuming the snapshot (Task 3 orders the messages via its
+           single reader task).
+
+           Actually, there's a subtle ordering issue: the daemon sends
+           SessionState + pane snapshots immediately on Attach. If the client
+           sends ResizePane only after parsing SessionState, the snapshot it
+           receives is for the OLD size, and when the PTY resizes, the shell
+           will redraw for the new size (SIGWINCH emits on resize and the
+           shell re-renders its prompt). This is fine because the client's
+           ScreenBuffer will get the redraw bytes as normal PaneOutput, just
+           slightly later. Document this in a code comment.
+
+        8. Verify:
+           ```
+           cargo build --workspace
+           cargo test --workspace
+           cargo clippy --workspace -- -D warnings
+           ```
+
+           Existing ipc_integration and rpc_integration tests should all
+           still pass since they don't exercise the new variants.
       </action>
 
       <verification>
-        <command>cargo wix -p cmux-daemon --nocapture</command>
+        <command>cargo build --workspace</command>
+        <command>cargo test --workspace</command>
+        <command>cargo clippy --workspace -- -D warnings</command>
+      </verification>
+
+      <done>
+        - SessionManager::resize_pane resizes both ConPty and daemon-side ScreenBuffer
+        - SessionManager stores per-workspace layout tree + active pane
+        - get_session_state returns layout + active_pane in WorkspaceInfo
+        - server.rs handles ResizePane and SetLayout client messages
+        - SplitPane passes through real cols/rows instead of hardcoding 80x24
+        - All 170+ tests still pass
+      </done>
+    </task>
+
+    <task id="3" type="integration" complete="false">
+      <name>Client: send ResizePane on attach + Event::Resize + split, reconstruct layout from SessionState tree, send SetLayout after changes</name>
+      <description>
+        Make the client the authoritative source of layout. On any layout-
+        changing event (attach, terminal resize, pane split, pane close,
+        workspace create/switch), the client: (1) recomputes its layout,
+        (2) sends ResizePane for every pane with current dimensions, (3) sends
+        SetLayout so the daemon can restore on reattach. On receiving
+        SessionState with a layout tree, reconstruct the LayoutEngine from
+        the tree instead of collapsing to a single pane.
+      </description>
+
+      <files>
+        <modify>
+          cmux-core/src/layout.rs            (add LayoutEngine::from_tree constructor)
+          cmux-client/src/pane_manager.rs    (rebuild_from_state uses layout tree; add sync_pane_sizes_with_daemon helper returning the resize intents)
+          cmux-client/src/terminal.rs        (call resize sync on attach/resize/split/close; send SetLayout after layout changes)
+        </modify>
+      </files>
+
+      <action>
+        1. In cmux-core/src/layout.rs, add a constructor that rebuilds a
+           LayoutEngine from a LayoutNode tree plus terminal dimensions and
+           active pane:
+
+           ```rust
+           impl LayoutEngine {
+               /// Reconstruct a LayoutEngine from a serialized layout tree.
+               /// `next_pane_id` should be one past the highest pane id in
+               /// the tree so future splits don't collide with existing ids.
+               pub fn from_tree(
+                   root: LayoutNode,
+                   terminal_rows: u16,
+                   terminal_cols: u16,
+                   active_pane: PaneId,
+                   next_pane_id: u32,
+               ) -&gt; Self {
+                   Self {
+                       root,
+                       terminal_rows,
+                       terminal_cols,
+                       next_pane_id,
+                       active_pane,
+                       zoomed_pane: None,
+                   }
+               }
+
+               /// Return the root layout node for serialization.
+               pub fn root(&amp;self) -&gt; &amp;LayoutNode {
+                   &amp;self.root
+               }
+           }
+           ```
+
+           Note: the LayoutEngine fields are currently pub(crate) or private.
+           Check what's already exposed and add the minimum needed to
+           reconstruct. If the fields aren't pub, from_tree has direct access
+           via `Self { ... }` so it works.
+
+        2. Add a unit test in layout.rs:
+           ```rust
+           #[test]
+           fn from_tree_round_trip() {
+               let mut engine = LayoutEngine::new(40, 120);
+               engine.split(SplitDirection::Vertical);
+               engine.split(SplitDirection::Horizontal);
+               let rects_before = engine.pane_rects();
+               let tree = engine.root().clone();
+               let active = engine.active_pane();
+               let restored = LayoutEngine::from_tree(tree, 40, 120, active, 3);
+               let rects_after = restored.pane_rects();
+               assert_eq!(rects_before.len(), rects_after.len());
+               assert_eq!(rects_before, rects_after);
+           }
+           ```
+
+        3. In cmux-client/src/pane_manager.rs, update `rebuild_from_state` to
+           accept and use the layout tree:
+
+           - Change signature:
+             ```rust
+             pub fn rebuild_from_state(
+                 session_name: String,
+                 workspaces: &amp;[WorkspaceInfo],
+                 active_workspace: u32,
+                 rows: u16,
+                 cols: u16,
+             ) -&gt; Self
+             ```
+             (signature stays the same — the WorkspaceInfo itself now carries
+             the optional layout.)
+
+           - Inside, for each workspace, check `ws.layout.as_ref()`:
+             * If Some, use `LayoutEngine::from_tree(layout.clone(), rows, cols,
+               PaneId(ws.active_pane.unwrap_or(0)), next_pane_id)`. Compute
+               next_pane_id as `max(pane_ids) + 1`.
+             * If None, fall back to the current single-pane flat
+               reconstruction (backwards compat).
+
+           - For each pane id in the reconstructed layout, create a
+             ScreenBuffer matching the pane's rect from the new LayoutEngine
+             (not one big buffer). Sizes come from `engine.pane_rects()` —
+             each rect tells you the cols/rows for that pane.
+
+        4. Add a new method to PaneManager that returns the current layout
+           snapshot in a form suitable for SetLayout:
+
+           ```rust
+           pub fn current_layout_snapshot(&amp;self) -&gt; Option&lt;(u32, LayoutNode, u32)&gt; {
+               let ws = self.active_workspace;
+               let layout = self.workspaces.get(&amp;ws)?;
+               Some((ws, layout.layout.root().clone(), self.active_pane().0))
+           }
+           ```
+
+           And a method to compute resize intents for all panes in the active
+           workspace:
+
+           ```rust
+           /// Return (pane_id, cols, rows) tuples for every pane in the
+           /// active workspace, based on the current layout rects.
+           pub fn pane_resize_intents(&amp;self) -&gt; Vec&lt;(u32, u16, u16)&gt; {
+               self.layout()
+                   .pane_rects()
+                   .into_iter()
+                   .map(|r| (r.pane_id.0, r.width, r.height))
+                   .collect()
+           }
+           ```
+
+        5. In cmux-client/src/terminal.rs, add a helper async fn that sends
+           resize + set-layout for the current state. Call it at every
+           layout-changing moment:
+
+           ```rust
+           async fn sync_layout_to_daemon&lt;W: AsyncWrite + Unpin&gt;(
+               panes: &amp;PaneManager,
+               pipe_writer: &amp;mut W,
+           ) -&gt; anyhow::Result&lt;()&gt; {
+               // Resize each pane to match the current layout.
+               for (pane_id, cols, rows) in panes.pane_resize_intents() {
+                   let msg = ClientMessage::ResizePane { pane_id, cols, rows };
+                   transport::write_message(pipe_writer, &amp;msg).await?;
+               }
+               // Persist the layout tree so reattach restores it.
+               if let Some((workspace_id, layout, active_pane)) =
+                   panes.current_layout_snapshot()
+               {
+                   let msg = ClientMessage::SetLayout { workspace_id, layout, active_pane };
+                   transport::write_message(pipe_writer, &amp;msg).await?;
+               }
+               Ok(())
+           }
+           ```
+
+        6. Call sync_layout_to_daemon at these points in run_terminal:
+
+           - **Immediately after the initial render**, so the daemon-side
+             PTYs get sized correctly for the fresh session.
+           - **On Event::Resize**, after `panes.resize_terminal(...)`.
+           - **After SessionState is processed** (in the server_rx.recv()
+             arm that calls PaneManager::rebuild_from_state). This catches
+             the reattach case where the layout tree may have been restored
+             from the stored snapshot.
+           - **In handle_prefix_command, after each layout-changing action**:
+             * `SplitVertical` / `SplitHorizontal` — after `panes.split(...)`
+               (but BEFORE the current transport::write_message of
+               ClientMessage::SplitPane which is then no longer needed because
+               the daemon knows what to do from the resize + new pane flow)
+             * Actually, SplitPane is still needed — it tells the daemon to
+               spawn a new PTY. But SplitPane should now carry the new pane's
+               dimensions. After split + SplitPane round-trip, call
+               sync_layout_to_daemon to update everything.
+             * `ClosePane` — after `panes.close_pane(...)`
+             * `ToggleZoom` — after `panes.layout_mut().toggle_zoom()`
+             * `NavigateXxx` / `CyclePaneForward` — after navigation, to
+               update `active_pane` in the stored snapshot
+             * `CreateWorkspace` / `NextWorkspace` / `PrevWorkspace` /
+               `SelectWorkspace` — after workspace switches
+
+        7. Update `ClientMessage::SplitPane` call site: the split handler in
+           handle_prefix_command needs to compute the new pane's target dims
+           from the layout AFTER splitting locally, then send SplitPane with
+           those dims:
+
+           ```rust
+           Some(Action::SplitVertical) =&gt; {
+               let new_pane_id = panes.split(SplitDirection::Vertical);
+               // Find the new pane's rect to tell the daemon what size to spawn at
+               let rect = panes.layout().pane_rects()
+                   .into_iter()
+                   .find(|r| r.pane_id == new_pane_id)
+                   .expect("just-created pane must have a rect");
+               transport::write_message(pipe_writer, &amp;ClientMessage::SplitPane {
+                   direction: "vertical".into(),
+                   cols: rect.width,
+                   rows: rect.height,
+               }).await?;
+               sync_layout_to_daemon(panes, pipe_writer).await?;
+               // Render
+           }
+           ```
+
+        8. Tests to add in pane_manager.rs:
+
+           - `rebuild_from_state_with_layout_tree_preserves_splits`: build a
+             WorkspaceInfo with a vertical split layout, call
+             rebuild_from_state, assert the reconstructed PaneManager has
+             the right number of panes and pane_rects matches.
+           - `rebuild_from_state_without_layout_tree_falls_back_to_flat`:
+             build a WorkspaceInfo with layout: None, assert fallback works
+             (backwards compat).
+           - `current_layout_snapshot_round_trips_through_rebuild`: split a
+             pane, take a snapshot, rebuild from it, assert the result
+             matches the original.
+           - `pane_resize_intents_matches_pane_rects`: after a split, verify
+             the intents match the layout rects exactly.
+
+        9. Verify:
+           ```
+           cargo build --workspace
+           cargo test --workspace
+           cargo clippy --workspace -- -D warnings
+           cargo fmt --all --check
+           cargo build --release --workspace
+           ```
+      </action>
+
+      <verification>
+        <command>cargo build --workspace</command>
+        <command>cargo clippy --workspace -- -D warnings</command>
+        <command>cargo fmt --all --check</command>
+        <command>cargo test --workspace</command>
         <manual>
-          1. Push a throwaway tag: `git tag v0.0.1-test-msi &amp;&amp; git push origin v0.0.1-test-msi`
-          2. Watch the release workflow in GitHub Actions
-          3. Verify a Release is created with BOTH .zip and .msi artifacts attached
-          4. Download the MSI, install on a second Windows machine, verify cmux works
-          5. Delete the test tag + release afterward:
-             `git push origin :refs/tags/v0.0.1-test-msi` then delete the release via GH UI
-          6. README Install from MSI section renders correctly on GitHub preview
+          1. Build release: `cargo build --release --workspace`
+          2. Start daemon in Window 1, client in Window 2
+          3. Run `claude` inside a single-pane cmux session — UI should
+             render correctly, no overlapping text (fixes the Claude Code
+             screenshot bug directly)
+          4. Resize the Windows Terminal window — Claude Code should reflow
+             to the new dimensions
+          5. Split with Ctrl+B %, run `vim` in one pane and `htop` in the
+             other — both should render correctly at their actual pane sizes
+          6. Detach with Ctrl+B d, reattach with `cmux attach -t main` —
+             BOTH panes should still be there with their content restored,
+             not collapsed to a single pane
+          7. After reattach, resize the Windows Terminal window again —
+             both panes should reflow correctly
         </manual>
       </verification>
 
       <done>
-        - release.yml installs cargo-wix and builds an MSI
-        - Tag push uploads both .zip and .msi to the GitHub Release
-        - README has an Install from MSI section with SmartScreen caveat
-        - Local `cargo wix` still works independently of CI
+        - Claude Code renders correctly inside cmux at the client's pane size
+        - Resizing the Windows Terminal window reflows TUIs to the new size
+        - Detach + reattach preserves split-pane layouts (not collapsed to one)
+        - Reattached panes show their content at the correct size
+        - LayoutEngine::from_tree() unit tested
+        - PaneManager rebuild from layout tree unit tested (with + without tree)
+        - All tests pass, clippy + fmt clean
       </done>
     </task>
   </tasks>
 
   <phase_verification>
     <commands>
-      <command>cargo wix -p cmux-daemon --nocapture</command>
+      <command>cargo build --workspace</command>
       <command>cargo build --release --workspace</command>
+      <command>cargo clippy --workspace -- -D warnings</command>
+      <command>cargo fmt --all --check</command>
       <command>cargo test --workspace</command>
     </commands>
     <manual>
-      1. Local MSI build works and installs a usable cmux on the dev machine
-      2. Uninstall + reinstall leaves the machine clean
-      3. Upgrade (new version on top of old) works without orphaned files
-      4. CI release workflow produces both zip and msi artifacts
-      5. MSI installed on a SECOND Windows machine and used successfully (the
-         whole reason for this phase)
+      1. Claude Code renders correctly inside a single-pane cmux session
+      2. vim + htop render correctly inside split panes
+      3. Resizing the Windows Terminal window reflows content
+      4. Detach + reattach preserves multi-pane layout AND each pane's content
+      5. No regressions in the existing keybinding, workspace, or copy-mode flows
+      6. JSON-RPC path still works (regression check — Phase 8 surface)
     </manual>
   </phase_verification>
 
   <completion_criteria>
-    <criterion>All 2 tasks marked complete</criterion>
-    <criterion>Local MSI build produces a working installer</criterion>
-    <criterion>MSI installs cmux-daemon + cmux-client + docs + RPC script to Program Files</criterion>
-    <criterion>System PATH is updated during install, cleaned up on uninstall</criterion>
-    <criterion>Upgrade-over-existing works without manual cleanup</criterion>
-    <criterion>CI release workflow produces and uploads the MSI on tag push</criterion>
-    <criterion>README documents the MSI install path with the SmartScreen caveat</criterion>
-    <criterion>Stable UpgradeCode GUID committed so future releases upgrade cleanly</criterion>
-    <criterion>Tested on a second Windows machine end-to-end</criterion>
+    <criterion>All 3 tasks marked complete</criterion>
+    <criterion>All cargo verification commands pass</criterion>
+    <criterion>Claude Code inside cmux renders without corruption (the screenshot bug)</criterion>
+    <criterion>Detach + reattach of a 2-pane split preserves both panes and their content</criterion>
+    <criterion>Terminal window resize propagates to all panes in the active workspace</criterion>
+    <criterion>Workspace layouts are preserved across workspace switches (SetLayout per workspace)</criterion>
+    <criterion>At least 4 new tests: ResizePane round-trip, WorkspaceInfo with layout round-trip, LayoutEngine::from_tree, PaneManager rebuild with tree</criterion>
   </completion_criteria>
 
-  <deferred>
-    Not in this phase's scope (maybe never):
-    - Code signing the MSI with a real certificate (costs ~$200/yr, eliminates SmartScreen warning)
-    - Per-user (non-admin) install option
-    - Start Menu shortcuts to cmux-daemon
-    - Windows Service registration for cmux-daemon
-    - WinGet manifest submission (can ride on top of this MSI once it exists)
-    - Scoop manifest (pairs better with the .zip than the MSI)
-    - Chocolatey package (similar — zip-based is simpler)
-  </deferred>
-
   <risks>
-    1. **cargo-wix + workspace friction.** cargo-wix expects to operate on a
-       single bin crate. Running from the workspace root may need `-p cmux-daemon`
-       on every invocation. If `cargo wix init` outputs files in the wrong
-       location, may need to run it from `cmux-daemon/` directory instead of
-       repo root. Task 1 step 4 calls this out.
+    1. **Message ordering on attach.** The daemon sends SessionState + pane
+       snapshots in one burst. The client processes them serially from its
+       dedicated reader task. Between receiving SessionState and calling
+       sync_layout_to_daemon, the client is still reading the snapshot
+       PaneOutput messages. The snapshots were captured at the OLD PTY size.
+       When the resize arrives, the shell gets SIGWINCH and redraws its
+       prompt for the new size, which will arrive as new PaneOutput after
+       the snapshot. Net effect: brief visual glitch for ~50ms on reattach,
+       then correct rendering. Acceptable. Document in a code comment.
 
-    2. **WiX 3 vs WiX 4/5.** cargo-wix 0.3.x uses WiX 3. cargo-wix 0.4.x uses
-       WiX 4/5. GitHub Actions windows-latest has WiX 3 pre-installed, so
-       sticking with cargo-wix 0.3.x is the path of least resistance. If you
-       want to use WiX 4 (newer, fewer dependencies), add `choco install wixtoolset5`
-       to the workflow.
+    2. **Multi-client case is degraded.** If two clients attach to the
+       same session, only the most recently resizing client "wins" — the
+       PTY is whatever size the last client said. The client-side
+       ScreenBuffers will disagree until one of them sends its own resize.
+       We already have this limitation implicitly (single-active-client
+       model), so formalize it in a README note. Not a regression from
+       current behavior.
 
-    3. **GUID stability.** If the UpgradeCode in [package.metadata.wix] is
-       changed between releases, Windows treats the new MSI as a completely
-       different product and doesn't uninstall the old one. The plan sets the
-       GUID once and commits it. Resist temptation to regenerate it.
+    3. **LayoutEngine field visibility.** `from_tree` needs to construct
+       the engine directly. If current fields are private, this either
+       requires marking them pub(crate), adding a builder, or putting
+       from_tree in the same module (which it is, so that's fine).
 
-    4. **Admin requirement for PATH.** Per-machine install needs UAC. For a
-       "install on another machine easily" use case this is fine, but note
-       that running `msiexec /i cmux.msi /quiet` in CI or automation needs
-       elevation. Per-user install without PATH is possible but doesn't meet
-       the original goal (needing to `cd` to the install dir to run the exes
-       defeats the purpose).
+    4. **Pane-ID collision after reattach.** `from_tree` takes an explicit
+       next_pane_id that the client must compute as max(existing ids) + 1.
+       If the client gets this wrong, a future split could collide with an
+       existing pane id on the daemon side and the daemon's
+       `panes.contains_key(&amp;new_id)` check would prevent the spawn but the
+       client's layout would be wrong. Task 3 includes a test for this.
 
-    5. **SmartScreen warning.** Unsigned MSI will trigger Windows Defender
-       SmartScreen: "Windows protected your PC." Users have to click
-       "More info" → "Run anyway." Documented in README. Only fix is code
-       signing, which costs money and is deferred.
+    5. **SplitPane race.** On split, the client: (a) updates its local
+       layout, (b) sends SplitPane to the daemon to spawn the PTY, (c)
+       sends sync_layout_to_daemon (which includes a ResizePane for the
+       NEW pane). If sync runs before the daemon has finished handling
+       SplitPane, the ResizePane for the new pane id will fail with
+       PaneNotFound. Mitigation: the daemon logs the warning and continues;
+       the client will resend on the next layout change. Alternatively,
+       await the PaneCreated response before sending sync. Pick the latter
+       for correctness.
 
-    6. **File paths on CI vs local.** The Source= attributes in main.wxs use
-       relative paths like `target\release\cmux-client.exe` or
-       `$(var.CargoTargetBinDir)\cmux-client.exe`. The cargo-wix documentation
-       for the right form varies by version — if the initial build fails with
-       "file not found," check what variable cargo-wix exposes in the current
-       version and adjust.
+    6. **Zoomed panes.** When a pane is zoomed, pane_rects() returns only
+       the zoomed pane at full terminal size. The resize intents would
+       only include that one pane. When unzooming, we need to resend
+       resize for all panes. Task 3 already hooks ToggleZoom, so this
+       falls out naturally.
   </risks>
+
+  <deferred>
+    - MCP server bridge (still listed in REQUIREMENTS.md but not this phase)
+    - Scrollback search in copy mode
+    - Scrollback history navigation in copy mode
+    - JSON-RPC event streaming subscriptions
+    - Code signing for the MSI
+    - Cross-platform support
+  </deferred>
 </plan>

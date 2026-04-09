@@ -1,4 +1,4 @@
-use cmux_core::layout::{LayoutEngine, SplitDirection};
+use cmux_core::layout::{LayoutEngine, LayoutNode, SplitDirection};
 use cmux_core::screen::{ScreenBuffer, ScreenSnapshot};
 use cmux_core::types::PaneId;
 use cmux_ipc::messages::WorkspaceInfo;
@@ -234,6 +234,12 @@ impl PaneManager {
     }
 
     /// Rebuild the entire pane manager state from a session state message (for reattach).
+    ///
+    /// If a `WorkspaceInfo` carries a `layout` tree (produced by the daemon's
+    /// `SetLayout` storage from a previous session), reconstruct the full
+    /// multi-pane layout via `LayoutEngine::from_tree`. Otherwise fall back
+    /// to a flat single-pane layout (forward-compat for older daemons that
+    /// didn't populate the field).
     pub fn rebuild_from_state(
         session_name: String,
         workspaces: &[WorkspaceInfo],
@@ -245,20 +251,45 @@ impl PaneManager {
         let mut ws_names = HashMap::new();
 
         for ws_info in workspaces {
-            let first_pane_id = ws_info.pane_ids.first().copied().unwrap_or(0);
-            let layout = LayoutEngine::new_with_pane_id(rows, cols, PaneId(first_pane_id));
-            let mut screens = HashMap::new();
+            let layout = match ws_info.layout.clone() {
+                Some(tree) => {
+                    let max_id = ws_info.pane_ids.iter().copied().max().unwrap_or(0);
+                    let active = ws_info
+                        .active_pane
+                        .map(PaneId)
+                        .unwrap_or(PaneId(ws_info.pane_ids.first().copied().unwrap_or(0)));
+                    LayoutEngine::from_tree(tree, rows, cols, active, max_id + 1)
+                }
+                None => {
+                    let first_pane_id = ws_info.pane_ids.first().copied().unwrap_or(0);
+                    LayoutEngine::new_with_pane_id(rows, cols, PaneId(first_pane_id))
+                }
+            };
 
-            // Create screen buffers for all panes in this workspace.
-            // For reattach, the first pane is the layout root; additional panes
-            // would require splits but we don't know the layout structure from
-            // just pane ids. For now, create the primary pane and screen.
-            // The daemon will send output that will populate the screens.
-            for &pid in &ws_info.pane_ids {
+            // Create screen buffers sized to each pane's actual rect in the
+            // reconstructed layout. Previously every pane got a buffer the
+            // size of the whole terminal, which caused the exact rendering
+            // corruption this phase fixes for the single-pane-per-session
+            // case. The daemon will replay each pane's content via
+            // PaneOutput immediately after SessionState.
+            let rects = layout.pane_rects();
+            let mut screens = HashMap::new();
+            for rect in &rects {
                 screens.insert(
-                    PaneId(pid),
-                    ScreenBuffer::new(rows, cols, cmux_config::defaults::DEFAULT_SCROLLBACK),
+                    rect.pane_id,
+                    ScreenBuffer::new(
+                        rect.height,
+                        rect.width,
+                        cmux_config::defaults::DEFAULT_SCROLLBACK,
+                    ),
                 );
+            }
+            // Cover any pane_ids that weren't materialized by the layout
+            // tree (e.g. if the stored tree is somehow stale vs. pane_ids).
+            for &pid in &ws_info.pane_ids {
+                screens.entry(PaneId(pid)).or_insert_with(|| {
+                    ScreenBuffer::new(rows, cols, cmux_config::defaults::DEFAULT_SCROLLBACK)
+                });
             }
 
             ws_map.insert(ws_info.id, WorkspaceState { layout, screens });
@@ -283,6 +314,30 @@ impl PaneManager {
             active_workspace,
             session_name,
         }
+    }
+
+    /// Return the current active workspace's layout as a (workspace_id,
+    /// layout_tree_clone, active_pane_id) triple, suitable for sending to
+    /// the daemon via `ClientMessage::SetLayout`.
+    pub fn current_layout_snapshot(&self) -> Option<(u32, LayoutNode, u32)> {
+        let ws = self.active_workspace;
+        let state = self.workspaces.get(&ws)?;
+        Some((
+            ws,
+            state.layout.root().clone(),
+            state.layout.active_pane().0,
+        ))
+    }
+
+    /// Return `(pane_id, cols, rows)` tuples for every pane in the active
+    /// workspace, based on the current layout rects. The client uses this
+    /// to tell the daemon how big each PTY should be via ResizePane.
+    pub fn pane_resize_intents(&self) -> Vec<(u32, u16, u16)> {
+        self.layout()
+            .pane_rects()
+            .into_iter()
+            .map(|r| (r.pane_id.0, r.width, r.height))
+            .collect()
     }
 }
 
@@ -399,11 +454,15 @@ mod tests {
                 id: 0,
                 name: "main".into(),
                 pane_ids: vec![0],
+                layout: None,
+                active_pane: None,
             },
             WorkspaceInfo {
                 id: 1,
                 name: "work".into(),
                 pane_ids: vec![3],
+                layout: None,
+                active_pane: None,
             },
         ];
 
@@ -512,5 +571,89 @@ mod tests {
         // Click on border row should return None
         let border_row = top.height;
         assert_eq!(pm.pane_at_position(border_row, 40), None);
+    }
+
+    #[test]
+    fn rebuild_from_state_with_layout_tree_preserves_splits() {
+        use cmux_core::layout::{LayoutNode, SplitDirection};
+
+        let tree = LayoutNode::Split {
+            direction: SplitDirection::Vertical,
+            ratio: 0.5,
+            first: Box::new(LayoutNode::Leaf { pane_id: PaneId(0) }),
+            second: Box::new(LayoutNode::Leaf { pane_id: PaneId(1) }),
+        };
+        let ws_infos = vec![WorkspaceInfo {
+            id: 0,
+            name: "main".into(),
+            pane_ids: vec![0, 1],
+            layout: Some(tree),
+            active_pane: Some(1),
+        }];
+        let pm = PaneManager::rebuild_from_state("test".into(), &ws_infos, 0, 24, 80);
+        // Both panes must exist in the reconstructed layout.
+        let rects = pm.layout().pane_rects();
+        assert_eq!(rects.len(), 2);
+        let ids: Vec<u32> = rects.iter().map(|r| r.pane_id.0).collect();
+        assert!(ids.contains(&0));
+        assert!(ids.contains(&1));
+        // Active pane should match the stored snapshot.
+        assert_eq!(pm.active_pane(), PaneId(1));
+    }
+
+    #[test]
+    fn rebuild_from_state_without_layout_tree_falls_back_to_flat() {
+        // Forward-compat path: older daemon sends WorkspaceInfo without layout.
+        let ws_infos = vec![WorkspaceInfo {
+            id: 0,
+            name: "main".into(),
+            pane_ids: vec![0, 1, 2],
+            layout: None,
+            active_pane: None,
+        }];
+        let pm = PaneManager::rebuild_from_state("test".into(), &ws_infos, 0, 24, 80);
+        // Flat layout means single pane using first id.
+        assert_eq!(pm.layout().pane_rects().len(), 1);
+    }
+
+    #[test]
+    fn current_layout_snapshot_round_trips_through_rebuild() {
+        use cmux_core::layout::SplitDirection;
+
+        let mut pm = PaneManager::new(40, 120);
+        pm.split(SplitDirection::Vertical);
+        let before_rects = pm.layout().pane_rects();
+        assert_eq!(before_rects.len(), 2);
+
+        let (ws_id, tree, active) = pm.current_layout_snapshot().unwrap();
+        let ws_info = WorkspaceInfo {
+            id: ws_id,
+            name: "0".into(),
+            pane_ids: before_rects.iter().map(|r| r.pane_id.0).collect(),
+            layout: Some(tree),
+            active_pane: Some(active),
+        };
+        let restored = PaneManager::rebuild_from_state("s".into(), &[ws_info], ws_id, 40, 120);
+        let after_rects = restored.layout().pane_rects();
+        assert_eq!(before_rects, after_rects);
+        assert_eq!(restored.active_pane(), pm.active_pane());
+    }
+
+    #[test]
+    fn pane_resize_intents_matches_layout_rects() {
+        use cmux_core::layout::SplitDirection;
+
+        let mut pm = PaneManager::new(40, 120);
+        pm.split(SplitDirection::Vertical);
+        pm.split(SplitDirection::Horizontal);
+
+        let rects = pm.layout().pane_rects();
+        let intents = pm.pane_resize_intents();
+        assert_eq!(rects.len(), intents.len());
+        for (pid, cols, rows) in &intents {
+            let rect = rects.iter().find(|r| r.pane_id.0 == *pid).unwrap();
+            assert_eq!(*cols, rect.width);
+            assert_eq!(*rows, rect.height);
+        }
     }
 }

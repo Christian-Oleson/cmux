@@ -35,6 +35,13 @@ struct ManagedSession {
     next_workspace_id: u32,
     next_pane_id: u32,
     created_at: u64,
+    /// Most recent client-sent layout tree per workspace. The daemon doesn't
+    /// compute or validate these — it just stores them so reattach can
+    /// replay the exact layout the client had at detach time.
+    workspace_layouts: HashMap<u32, cmux_core::layout::LayoutNode>,
+    /// Most recent client-sent active pane id per workspace, paired with
+    /// `workspace_layouts` for reattach state restoration.
+    workspace_active_panes: HashMap<u32, u32>,
 }
 
 pub struct SessionManager {
@@ -159,6 +166,8 @@ impl SessionManager {
                 next_workspace_id: 1,
                 next_pane_id: 1,
                 created_at,
+                workspace_layouts: HashMap::new(),
+                workspace_active_panes: HashMap::new(),
             },
         );
 
@@ -316,6 +325,59 @@ impl SessionManager {
         Err(CmuxError::PaneNotFound(cmux_core::types::PaneId(pane_id)))
     }
 
+    /// Resize a pane's PTY and daemon-side ScreenBuffer in lockstep. Both
+    /// MUST stay in sync — if they disagree, vt100 will misinterpret the
+    /// byte stream and produce the rendering corruption this task fixes.
+    pub async fn resize_pane(
+        &self,
+        session_name: &str,
+        pane_id: u32,
+        cols: u16,
+        rows: u16,
+    ) -> Result<(), CmuxError> {
+        if cols == 0 || rows == 0 {
+            return Err(CmuxError::Ipc(format!(
+                "resize_pane: invalid dims {cols}x{rows}"
+            )));
+        }
+        let sessions = self.sessions.lock().await;
+        let session = sessions
+            .get(session_name)
+            .ok_or_else(|| CmuxError::SessionNotFound(session_name.into()))?;
+        for ws in session.workspaces.values() {
+            if let Some(pane) = ws.panes.get(&pane_id) {
+                pane.pty.resize(cols, rows)?;
+                let mut screen = pane.screen.lock().await;
+                screen.resize(rows, cols);
+                debug!(pane_id, cols, rows, "pane resized");
+                return Ok(());
+            }
+        }
+        Err(CmuxError::PaneNotFound(cmux_core::types::PaneId(pane_id)))
+    }
+
+    /// Store the client's current layout tree and active pane for a
+    /// workspace. The daemon never interprets these — it only holds them so
+    /// future `get_session_state` calls (on reattach) can replay the layout
+    /// back to a client. The client is always the authoritative source.
+    pub async fn set_layout(
+        &self,
+        session_name: &str,
+        workspace_id: u32,
+        layout: cmux_core::layout::LayoutNode,
+        active_pane: u32,
+    ) -> Result<(), CmuxError> {
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions
+            .get_mut(session_name)
+            .ok_or_else(|| CmuxError::SessionNotFound(session_name.into()))?;
+        session.workspace_layouts.insert(workspace_id, layout);
+        session
+            .workspace_active_panes
+            .insert(workspace_id, active_pane);
+        Ok(())
+    }
+
     pub async fn get_session_state(
         &self,
         session_name: &str,
@@ -332,6 +394,8 @@ impl SessionManager {
                 id: ws.id,
                 name: ws.name.clone(),
                 pane_ids: ws.panes.keys().copied().collect(),
+                layout: session.workspace_layouts.get(&ws.id).cloned(),
+                active_pane: session.workspace_active_panes.get(&ws.id).copied(),
             })
             .collect();
         workspaces.sort_by_key(|w| w.id);

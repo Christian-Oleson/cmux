@@ -62,6 +62,34 @@ impl LayoutEngine {
         }
     }
 
+    /// Reconstruct a [`LayoutEngine`] from a serialized tree plus terminal
+    /// dimensions and an active pane. Used by clients on reattach to restore
+    /// the exact layout the daemon stored. `next_pane_id` should be one past
+    /// the highest pane id present in `root` so future splits don't collide
+    /// with existing panes.
+    pub fn from_tree(
+        root: LayoutNode,
+        terminal_rows: u16,
+        terminal_cols: u16,
+        active_pane: PaneId,
+        next_pane_id: u32,
+    ) -> Self {
+        Self {
+            root,
+            terminal_rows,
+            terminal_cols,
+            next_pane_id,
+            active_pane,
+            zoomed_pane: None,
+        }
+    }
+
+    /// Borrow the root layout node. Used by the client to serialize the
+    /// current layout and persist it with the daemon via SetLayout.
+    pub fn root(&self) -> &LayoutNode {
+        &self.root
+    }
+
     /// Return the rectangles for all visible panes.
     ///
     /// If a pane is zoomed, only that pane is returned at full terminal size.
@@ -719,6 +747,38 @@ mod tests {
         assert!(ids.contains(&PaneId(0)));
         assert!(ids.contains(&PaneId(1)));
         assert!(ids.contains(&PaneId(2)));
+    }
+
+    #[test]
+    fn from_tree_round_trip() {
+        let mut engine = LayoutEngine::new(40, 120);
+        engine.split(SplitDirection::Vertical);
+        engine.split(SplitDirection::Horizontal);
+        let before = engine.pane_rects();
+        let tree = engine.root().clone();
+        let active = engine.active_pane();
+        let restored = LayoutEngine::from_tree(tree, 40, 120, active, 3);
+        let after = restored.pane_rects();
+        assert_eq!(before, after);
+        assert_eq!(restored.active_pane(), active);
+    }
+
+    #[test]
+    fn from_tree_preserves_vertical_split() {
+        let tree = LayoutNode::Split {
+            direction: SplitDirection::Vertical,
+            ratio: 0.5,
+            first: Box::new(LayoutNode::Leaf { pane_id: PaneId(0) }),
+            second: Box::new(LayoutNode::Leaf { pane_id: PaneId(1) }),
+        };
+        let engine = LayoutEngine::from_tree(tree, 24, 80, PaneId(1), 2);
+        let rects = engine.pane_rects();
+        assert_eq!(rects.len(), 2);
+        // Vertical split: first on the left, second on the right, 1 col border.
+        let left = rects.iter().find(|r| r.pane_id == PaneId(0)).unwrap();
+        let right = rects.iter().find(|r| r.pane_id == PaneId(1)).unwrap();
+        assert_eq!(left.col, 0);
+        assert!(right.col > left.col + left.width);
     }
 
     #[test]

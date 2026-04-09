@@ -225,10 +225,17 @@ where
                 }
             }
 
-            ClientMessage::SplitPane { direction: _ } => {
+            ClientMessage::SplitPane {
+                direction: _,
+                cols,
+                rows,
+            } => {
                 if let Some(ref session_name) = attached_session {
-                    // Use default terminal size for new pane — client will resize
-                    match session_manager.split_pane(session_name, 80, 24).await {
+                    // Client passes real layout dimensions for the new pane
+                    // rather than the legacy hardcoded 80x24. This is what
+                    // makes TUIs like Claude Code render correctly at the
+                    // pane's actual size.
+                    match session_manager.split_pane(session_name, cols, rows).await {
                         Ok((pane_id, cols, rows)) => {
                             let _ = resp_tx
                                 .send(ServerMessage::PaneCreated {
@@ -247,6 +254,38 @@ where
                         }
                     }
                 }
+            }
+
+            ClientMessage::ResizePane {
+                pane_id,
+                cols,
+                rows,
+            } => {
+                if let Some(ref session_name) = attached_session {
+                    if let Err(e) = session_manager
+                        .resize_pane(session_name, pane_id, cols, rows)
+                        .await
+                    {
+                        warn!(pane_id, cols, rows, error = %e, "resize_pane failed");
+                    }
+                }
+                // Fire-and-forget: no response.
+            }
+
+            ClientMessage::SetLayout {
+                workspace_id,
+                layout,
+                active_pane,
+            } => {
+                if let Some(ref session_name) = attached_session {
+                    if let Err(e) = session_manager
+                        .set_layout(session_name, workspace_id, layout, active_pane)
+                        .await
+                    {
+                        warn!(workspace_id, error = %e, "set_layout failed");
+                    }
+                }
+                // Fire-and-forget: no response.
             }
 
             ClientMessage::ClosePane { pane_id } => {
